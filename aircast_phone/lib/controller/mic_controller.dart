@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:typed_data';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:get/get.dart';
 import 'package:record/record.dart';
 import 'package:shared_protocol/shared_protocol.dart';
+import '../services/foreground_mic_service.dart';
 import 'client_controller.dart';
 
 class MicController extends GetxController {
@@ -16,6 +18,8 @@ class MicController extends GetxController {
   final RxBool echoCancellation = false.obs;
   final RxDouble gain = 1.0.obs;
 
+  final RxBool isBatteryUnrestricted = true.obs;
+
   /// Smoothed 0.0..1.0 level updated at ~25 FPS for the UI meter.
   final RxDouble meterLevel = 0.0.obs;
   final RxBool isClipping = false.obs;
@@ -23,7 +27,8 @@ class MicController extends GetxController {
   final RxString statusText = 'Idle — tap Start Mic to stream'.obs;
 
   StreamSubscription<Uint8List>? _audioSub;
-  Worker? _disconnectWorker;
+  Worker? _connectionWorker;
+  Worker? _reconnectingWorker;
   Timer? _uiMeterTimer;
   Timer? _statsTimer;
 
@@ -34,8 +39,6 @@ class MicController extends GetxController {
   double _pendingRawLevel = 0.0;
   bool _pendingClipping = false;
   int _packetsCounter = 0;
-
-
 
   AudioConfig get currentConfig => AudioConfig(
     sampleRate: AudioConfig.defaultSampleRate,
@@ -51,16 +54,43 @@ class MicController extends GetxController {
   void onInit() {
     super.onInit();
 
-    // Auto-stop mic if the TCP socket drops so Android doesn't hold the mic open.
-    _disconnectWorker = ever(client.isConnected, (bool connected) {
-      if (!connected && isStreaming.value) {
+    ForegroundMicService.init();
+    FlutterForegroundTask.addTaskDataCallback(_onForegroundTaskData);
+
+    // Handle connection drops & seamless auto-resume when Wi-Fi recovers
+    _connectionWorker = ever(client.isConnected, (bool connected) {
+      if (!isStreaming.value) return;
+
+      if (connected) {
+        // Socket recovered while mic & foreground service stayed alive!
+        _pcmAccumulator.clear();
+        _syncConfigToDesktop();
+        client.sendControl({'cmd': 'audio_state', 'streaming': true});
+        statusText.value = 'Streaming 48 kHz Mono PCM (Lock-safe)';
+        _refreshNotification();
+      } else if (client.isReconnecting.value) {
+        // Keep mic & FGS alive so Android 14+ lets us resume while locked
+        statusText.value = 'Connection lost — auto-reconnecting...';
+        ForegroundMicService.updateStatus(
+          title: 'AirCast Reconnecting...',
+          text: 'Waiting for PC (${client.lastHost.value})',
+          isMuted: isMuted.value,
+        );
+      } else {
         stopStreaming(reason: 'Disconnected from PC');
       }
     });
 
-    // Smooth UI meter updates at ~25 FPS (every 40 ms).
+    // If auto-reconnect gives up completely, cleanly release the mic & FGS
+    _reconnectingWorker = ever(client.isReconnecting, (bool reconnecting) {
+      if (!reconnecting && !client.isConnected.value && isStreaming.value) {
+        stopStreaming(reason: 'Disconnected (reconnect timed out)');
+      }
+    });
+
+    // Smooth UI meter updates at ~25 FPS
     _uiMeterTimer = Timer.periodic(const Duration(milliseconds: 40), (_) {
-      if (!isStreaming.value) {
+      if (!isStreaming.value || !client.isConnected.value) {
         if (meterLevel.value > 0.001) meterLevel.value = 0.0;
         if (isClipping.value) isClipping.value = false;
         return;
@@ -68,7 +98,6 @@ class MicController extends GetxController {
 
       final target = isMuted.value ? 0.0 : _pendingRawLevel;
       final current = meterLevel.value;
-      // Fast attack, smooth release
       final factor = target > current ? 0.65 : 0.22;
       meterLevel.value = current + (target - current) * factor;
       isClipping.value = !isMuted.value && _pendingClipping;
@@ -81,7 +110,34 @@ class MicController extends GetxController {
     });
   }
 
-  Future<void> startStreaming() async {
+  @override
+  void onReady() {
+    super.onReady();
+    refreshBatteryStatus();
+  }
+
+  Future<void> refreshBatteryStatus() async {
+    isBatteryUnrestricted.value =
+    await ForegroundMicService.isIgnoringBatteryOptimizations();
+  }
+
+  Future<void> requestUnrestrictedBattery() async {
+    await ForegroundMicService.requestIgnoreBatteryOptimization();
+    await Future.delayed(const Duration(milliseconds: 400));
+    await refreshBatteryStatus();
+  }
+
+  void _onForegroundTaskData(Object data) {
+    if (data is! Map) return;
+    final action = data['action'] as String?;
+    if (action == 'toggle_mute') {
+      toggleMute();
+    } else if (action == 'stop_mic') {
+      stopStreaming(reason: 'Stopped from notification');
+    }
+  }
+
+  Future<void> startStreaming({bool keepServiceAlive = false}) async {
     if (isBusy.value || isStreaming.value) return;
     if (!client.isConnected.value) {
       statusText.value = 'Connect to PC first';
@@ -89,9 +145,10 @@ class MicController extends GetxController {
     }
 
     isBusy.value = true;
-    statusText.value = 'Requesting microphone permission...';
+    statusText.value = 'Checking microphone permission...';
 
     try {
+      // 1. Must verify RECORD_AUDIO BEFORE starting a microphone FGS on Android 14+
       final permitted = await _recorder.hasPermission();
       if (!permitted) {
         statusText.value = 'Microphone permission denied';
@@ -103,9 +160,21 @@ class MicController extends GetxController {
         return;
       }
 
+      // 2. Start lock-screen Foreground Service (WakeLock + Wi-Fi Lock)
+      if (!keepServiceAlive) {
+        final fgsStarted = await ForegroundMicService.start(
+          serverName: client.serverName.value,
+          isMuted: isMuted.value,
+        );
+        if (!fgsStarted) {
+          client.log('Warning: Foreground service did not start cleanly');
+        }
+      }
+
       _pcmAccumulator.clear();
       _syncConfigToDesktop();
 
+      // 3. Start raw 48 kHz PCM capture on the primary bottom microphone
       final stream = await _recorder.startStream(
         RecordConfig(
           encoder: AudioEncoder.pcm16bits,
@@ -135,20 +204,30 @@ class MicController extends GetxController {
       );
 
       isStreaming.value = true;
-      statusText.value = 'Streaming 48 kHz Mono PCM';
+      statusText.value = 'Streaming 48 kHz Mono PCM (Lock-safe)';
       client.sendControl({'cmd': 'audio_state', 'streaming': true});
-      client.log('Mic streaming started (48 kHz PCM16)');
+      client.log('Mic streaming started (Foreground Service active)');
+      await refreshBatteryStatus();
     } catch (e) {
       client.log('Failed to start mic: $e');
       statusText.value = 'Error: $e';
       await _cleanupRecorder();
+      if (!keepServiceAlive) {
+        await ForegroundMicService.stop();
+      }
     } finally {
       isBusy.value = false;
     }
   }
 
   void _onRawPcmChunk(Uint8List rawChunk) {
-    if (!isStreaming.value || !client.isConnected.value) return;
+    if (!isStreaming.value) return;
+
+    // While auto-reconnecting, keep recorder warm and drop stale frames cleanly
+    if (!client.isConnected.value) {
+      _pcmAccumulator.clear();
+      return;
+    }
 
     _pcmAccumulator.add(rawChunk);
     if (_pcmAccumulator.length < AudioConfig.frameBytes20ms) return;
@@ -159,14 +238,12 @@ class MicController extends GetxController {
 
     while (allBytes.length - offset >= frameSize) {
       if (isMuted.value) {
-        // Send silent 20ms frame so PC jitter buffer never underruns/pops
         _pendingRawLevel = 0.0;
         _pendingClipping = false;
         if (client.sendAudioFrame(_silenceFrame)) {
           _packetsCounter++;
         }
       } else {
-        // Copy a clean 1920-byte frame and apply 16-bit PCM gain in-place
         final frame = Uint8List.fromList(
           Uint8List.sublistView(allBytes, offset, offset + frameSize),
         );
@@ -183,17 +260,22 @@ class MicController extends GetxController {
       offset += frameSize;
     }
 
-    // Keep leftover bytes (< 1920) for the next callback
     if (offset < allBytes.length) {
       _pcmAccumulator.add(Uint8List.sublistView(allBytes, offset));
     }
   }
 
-  Future<void> stopStreaming({String reason = 'Stopped'}) async {
+  Future<void> stopStreaming({
+    String reason = 'Stopped',
+    bool keepServiceAlive = false,
+  }) async {
     if (isBusy.value && !isStreaming.value) return;
     isBusy.value = true;
     try {
       await _cleanupRecorder();
+      if (!keepServiceAlive) {
+        await ForegroundMicService.stop();
+      }
       isStreaming.value = false;
       _pendingRawLevel = 0.0;
       meterLevel.value = 0.0;
@@ -210,6 +292,9 @@ class MicController extends GetxController {
   void toggleMute() {
     isMuted.value = !isMuted.value;
     _syncConfigToDesktop();
+    if (isStreaming.value) {
+      _refreshNotification();
+    }
   }
 
   void updateGain(double value) {
@@ -237,8 +322,19 @@ class MicController extends GetxController {
     if (!isStreaming.value) return;
 
     client.sendControl({'cmd': 'audio_reconfig'});
-    await stopStreaming(reason: 'Applying audio filter...');
-    await startStreaming();
+    await stopStreaming(
+      reason: 'Applying audio filter...',
+      keepServiceAlive: true,
+    );
+    await startStreaming(keepServiceAlive: true);
+  }
+
+  void _refreshNotification() {
+    ForegroundMicService.updateStatus(
+      title: isMuted.value ? 'AirCast Mic (Muted)' : 'AirCast Mic Active',
+      text: 'Streaming 48 kHz PCM to ${client.serverName.value}',
+      isMuted: isMuted.value,
+    );
   }
 
   void _syncConfigToDesktop() {
@@ -262,10 +358,13 @@ class MicController extends GetxController {
 
   @override
   void onClose() {
-    _disconnectWorker?.dispose();
+    FlutterForegroundTask.removeTaskDataCallback(_onForegroundTaskData);
+    _connectionWorker?.dispose();
+    _reconnectingWorker?.dispose();
     _uiMeterTimer?.cancel();
     _statsTimer?.cancel();
     _cleanupRecorder();
+    ForegroundMicService.stop();
     _recorder.dispose();
     super.onClose();
   }
