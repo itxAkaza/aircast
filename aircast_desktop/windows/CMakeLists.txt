@@ -111,6 +111,7 @@ install(FILES "${AOT_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"
 add_library(aircast_audio SHARED
         "runner/aircast_audio.cpp"
 )
+target_compile_features(aircast_audio PRIVATE cxx_std_17)
 target_link_libraries(aircast_audio PRIVATE winmm avrt)
 add_dependencies(${BINARY_NAME} aircast_audio)
 

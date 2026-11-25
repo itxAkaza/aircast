@@ -1,6 +1,10 @@
+#define NOMINMAX
 #include <windows.h>
 #include <mmsystem.h>
+#include <avrt.h>
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
@@ -9,6 +13,7 @@
 #include <vector>
 
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "avrt.lib")
 
 #define AIRCAST_API extern "C" __declspec(dllexport)
 
@@ -19,37 +24,203 @@ namespace {
     constexpr uint16_t kBitsPerSample = 16;
     constexpr uint32_t kBytesPerSec = kSampleRate * kChannels * (kBitsPerSample / 8); // 96,000 B/s
 
-    constexpr size_t kFrameBytes = 1920;         // 20 ms chunk
-    constexpr size_t kNumBuffers = 4;            // 80 ms total hardware queue
-    constexpr size_t kRingCapacity = 48000;      // 500 ms ring capacity
-    constexpr size_t kPrebufferBytes = 3840;     // 40 ms prebuffer before playback
-    constexpr size_t kMaxLatencyBytes = 11520;   // 120 ms ceiling (drops stale burst audio)
+    constexpr size_t kOutFrameSamples = 480;              // 10 ms @ 48 kHz
+    constexpr size_t kOutFrameBytes = kOutFrameSamples * 2;
+    constexpr size_t kNumBuffers = 4;                     // 40 ms hardware queue
+    constexpr size_t kFadeSamples = 128;                  // ~2.7 ms click-free ramp
 
-    std::mutex g_lifecycleMutex;
-    std::mutex g_ringMutex;
+    constexpr size_t kRingSamples = 24000;                // 500 ms ring capacity
+    constexpr size_t kTargetSamples = 2400;               // 50 ms steady-state target
+    constexpr size_t kPrebufferSamples = 2400;            // 50 ms initial prebuffer
+    constexpr size_t kHardCapSamples = 9600;              // 200 ms emergency overflow cap
 
-    uint8_t g_ring[kRingCapacity];
-    size_t g_readPos = 0;
-    size_t g_writePos = 0;
-    size_t g_available = 0;
-    bool g_buffering = true;
+    class SampleRing {
+    public:
+        void clear() {
+            std::lock_guard<std::mutex> lock(mutex_);
+            readPos_ = 0;
+            writePos_ = 0;
+            count_ = 0;
+            prebuffering_ = true;
+            consecutiveUnderruns_ = 0;
+            fracPos_ = 0.0;
+            smoothErr_ = 0.0;
+            lastSample_ = 0;
+            wasUnderrun_ = false;
+        }
 
-    std::atomic<bool> g_running{false};
-    std::atomic<bool> g_cableOpen{false};
-    std::atomic<bool> g_loopbackRequested{false};
-    std::atomic<bool> g_loopbackOpen{false};
-    std::atomic<uint32_t> g_underruns{0};
+        void resetCounters() {
+            underruns_.store(0, std::memory_order_relaxed);
+            overruns_.store(0, std::memory_order_relaxed);
+        }
 
-    HANDLE g_doneEvent = nullptr;
-    std::thread g_workerThread;
+        void pushBytes(const uint8_t* data, size_t byteLen) {
+            if (data == nullptr || byteLen < 2) return;
+            size_t numSamples = byteLen / 2;
+            const int16_t* samples = reinterpret_cast<const int16_t*>(data);
 
-    HWAVEOUT g_cableOut = nullptr;
-    WAVEHDR g_cableHdrs[kNumBuffers];
-    std::vector<uint8_t> g_cableBufs[kNumBuffers];
+            if (numSamples > kRingSamples) {
+                samples += (numSamples - kRingSamples);
+                numSamples = kRingSamples;
+            }
 
-    HWAVEOUT g_loopbackOut = nullptr;
-    WAVEHDR g_loopbackHdrs[kNumBuffers];
-    std::vector<uint8_t> g_loopbackBufs[kNumBuffers];
+            std::lock_guard<std::mutex> lock(mutex_);
+
+            if (count_ + numSamples > kRingSamples) {
+                const size_t overflow = (count_ + numSamples) - kRingSamples;
+                readPos_ = (readPos_ + overflow) % kRingSamples;
+                count_ -= overflow;
+                fracPos_ = 0.0;
+                overruns_.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            const size_t firstPart = std::min(numSamples, kRingSamples - writePos_);
+            std::memcpy(buf_ + writePos_, samples, firstPart * sizeof(int16_t));
+            if (firstPart < numSamples) {
+                std::memcpy(buf_, samples + firstPart, (numSamples - firstPart) * sizeof(int16_t));
+            }
+            writePos_ = (writePos_ + numSamples) % kRingSamples;
+            count_ += numSamples;
+
+            // Emergency cap only if Wi-Fi stalled > 200 ms and dumped a huge backlog
+            if (count_ > kHardCapSamples) {
+                const size_t drop = count_ - kTargetSamples;
+                readPos_ = (readPos_ + drop) % kRingSamples;
+                count_ -= drop;
+                fracPos_ = 0.0;
+                overruns_.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            if (prebuffering_ && count_ >= kPrebufferSamples) {
+                prebuffering_ = false;
+                consecutiveUnderruns_ = 0;
+            }
+        }
+
+        bool renderFrame(int16_t* out, size_t outSamples) {
+            std::lock_guard<std::mutex> lock(mutex_);
+
+            if (prebuffering_) {
+                writeFadeOutSilence(out, outSamples);
+                return false;
+            }
+
+            // Smooth PI-style drift control: nudges speed by up to ±0.6% (~10 cents, inaudible)
+            const double err = (static_cast<double>(count_) - static_cast<double>(kTargetSamples)) /
+                               static_cast<double>(kTargetSamples);
+            smoothErr_ = 0.98 * smoothErr_ + 0.02 * err;
+            const double delta = std::clamp(smoothErr_ * 0.006, -0.006, 0.006);
+            const double ratio = 1.0 + delta;
+
+            const size_t needed = static_cast<size_t>(std::ceil(fracPos_ + outSamples * ratio)) + 2;
+            if (count_ < needed) {
+                underruns_.fetch_add(1, std::memory_order_relaxed);
+                consecutiveUnderruns_++;
+                wasUnderrun_ = true;
+
+                // Only re-prebuffer after 100 ms continuous dropout, not on a 10 ms hiccup
+                if (consecutiveUnderruns_ >= 10) {
+                    prebuffering_ = true;
+                }
+                writeFadeOutSilence(out, outSamples);
+                return false;
+            }
+
+            consecutiveUnderruns_ = 0;
+            double pos = fracPos_;
+
+            for (size_t i = 0; i < outSamples; ++i) {
+                const size_t idx0 = static_cast<size_t>(pos);
+                const double frac = pos - static_cast<double>(idx0);
+                const int16_t s0 = buf_[(readPos_ + idx0) % kRingSamples];
+                const int16_t s1 = buf_[(readPos_ + idx0 + 1) % kRingSamples];
+                const double interp = static_cast<double>(s0) +
+                                      (static_cast<double>(s1) - static_cast<double>(s0)) * frac;
+                out[i] = static_cast<int16_t>(std::clamp(std::lround(interp), -32768L, 32767L));
+                pos += ratio;
+            }
+
+            const size_t consumed = static_cast<size_t>(pos);
+            readPos_ = (readPos_ + consumed) % kRingSamples;
+            count_ -= consumed;
+            fracPos_ = pos - static_cast<double>(consumed);
+
+            if (wasUnderrun_) {
+                const size_t ramp = std::min(kFadeSamples, outSamples);
+                for (size_t i = 0; i < ramp; ++i) {
+                    const double gain = static_cast<double>(i) / static_cast<double>(ramp);
+                    out[i] = static_cast<int16_t>(std::lround(out[i] * gain));
+                }
+                wasUnderrun_ = false;
+            }
+
+            lastSample_ = out[outSamples - 1];
+            return true;
+        }
+
+        int32_t bufferedMs() const {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return static_cast<int32_t>((count_ * 1000) / kSampleRate);
+        }
+
+        uint32_t underruns() const { return underruns_.load(std::memory_order_relaxed); }
+        uint32_t overruns() const { return overruns_.load(std::memory_order_relaxed); }
+
+    private:
+        void writeFadeOutSilence(int16_t* out, size_t outSamples) {
+            std::memset(out, 0, outSamples * sizeof(int16_t));
+            if (lastSample_ != 0) {
+                const size_t ramp = std::min(kFadeSamples, outSamples);
+                for (size_t i = 0; i < ramp; ++i) {
+                    const double gain = 1.0 - (static_cast<double>(i + 1) / static_cast<double>(ramp));
+                    out[i] = static_cast<int16_t>(std::lround(lastSample_ * gain));
+                }
+                lastSample_ = 0;
+            }
+        }
+
+        mutable std::mutex mutex_;
+        int16_t buf_[kRingSamples]{};
+        size_t readPos_ = 0;
+        size_t writePos_ = 0;
+        size_t count_ = 0;
+        bool prebuffering_ = true;
+        int consecutiveUnderruns_ = 0;
+        double fracPos_ = 0.0;
+        double smoothErr_ = 0.0;
+        int16_t lastSample_ = 0;
+        bool wasUnderrun_ = false;
+        std::atomic<uint32_t> underruns_{0};
+        std::atomic<uint32_t> overruns_{0};
+    };
+
+    struct OutputChannel {
+        SampleRing ring;
+        std::mutex lifecycleMutex;
+        std::atomic<bool> running{false};
+        std::atomic<bool> open{false};
+        HANDLE doneEvent = nullptr;
+        std::thread worker;
+        HWAVEOUT hOut = nullptr;
+        WAVEHDR hdrs[kNumBuffers]{};
+        std::vector<int16_t> bufs[kNumBuffers];
+    };
+
+    OutputChannel g_cable;
+    OutputChannel g_loopback;
+    std::mutex g_timerMutex;
+    bool g_timerPeriodActive = false;
+
+    void setTimerPeriod(bool enable) {
+        std::lock_guard<std::mutex> lock(g_timerMutex);
+        if (enable && !g_timerPeriodActive) {
+            timeBeginPeriod(1);
+            g_timerPeriodActive = true;
+        } else if (!enable && g_timerPeriodActive) {
+            timeEndPeriod(1);
+            g_timerPeriodActive = false;
+        }
+    }
 
     WAVEFORMATEX makePcmFormat() {
         WAVEFORMATEX wfx{};
@@ -89,284 +260,209 @@ namespace {
         return false;
     }
 
-    void clearRingLocked() {
-        g_readPos = 0;
-        g_writePos = 0;
-        g_available = 0;
-        g_buffering = true;
-    }
-
-    void pushRing(const uint8_t* data, size_t len) {
-        if (data == nullptr || len == 0) return;
-
-        if (len > kRingCapacity) {
-            data += (len - kRingCapacity);
-            len = kRingCapacity;
-        }
-
-        std::lock_guard<std::mutex> lock(g_ringMutex);
-
-        if (g_available + len > kRingCapacity) {
-            const size_t overflow = (g_available + len) - kRingCapacity;
-            g_readPos = (g_readPos + overflow) % kRingCapacity;
-            g_available -= overflow;
-        }
-
-        const size_t firstPart = (len <= (kRingCapacity - g_writePos))
-                                 ? len
-                                 : (kRingCapacity - g_writePos);
-        std::memcpy(g_ring + g_writePos, data, firstPart);
-        if (firstPart < len) {
-            std::memcpy(g_ring, data + firstPart, len - firstPart);
-        }
-        g_writePos = (g_writePos + len) % kRingCapacity;
-        g_available += len;
-
-        // Shed stale audio if Wi-Fi bursts queued more than 120 ms
-        if (g_available > kMaxLatencyBytes) {
-            const size_t drop = g_available - kPrebufferBytes;
-            g_readPos = (g_readPos + drop) % kRingCapacity;
-            g_available -= drop;
-        }
-
-        if (g_buffering && g_available >= kPrebufferBytes) {
-            g_buffering = false;
-        }
-    }
-
-    bool popFrame(uint8_t* outFrame) {
-        std::lock_guard<std::mutex> lock(g_ringMutex);
-
-        if (g_buffering || g_available < kFrameBytes) {
-            if (!g_buffering && g_available < kFrameBytes) {
-                g_buffering = true;
-                g_underruns.fetch_add(1, std::memory_order_relaxed);
-            }
-            std::memset(outFrame, 0, kFrameBytes);
-            return false;
-        }
-
-        const size_t firstPart = (kFrameBytes <= (kRingCapacity - g_readPos))
-                                 ? kFrameBytes
-                                 : (kRingCapacity - g_readPos);
-        std::memcpy(outFrame, g_ring + g_readPos, firstPart);
-        if (firstPart < kFrameBytes) {
-            std::memcpy(outFrame + firstPart, g_ring, kFrameBytes - firstPart);
-        }
-        g_readPos = (g_readPos + kFrameBytes) % kRingCapacity;
-        g_available -= kFrameBytes;
-        return true;
-    }
-
-    void closeDevice(HWAVEOUT& hOut, WAVEHDR* hdrs) {
-        if (hOut == nullptr) return;
-        waveOutReset(hOut);
+    void closeChannelDevice(OutputChannel& ch) {
+        if (ch.hOut == nullptr) return;
+        waveOutReset(ch.hOut);
         for (size_t i = 0; i < kNumBuffers; ++i) {
-            if (hdrs[i].dwFlags & WHDR_PREPARED) {
-                waveOutUnprepareHeader(hOut, &hdrs[i], sizeof(WAVEHDR));
+            if (ch.hdrs[i].dwFlags & WHDR_PREPARED) {
+                waveOutUnprepareHeader(ch.hOut, &ch.hdrs[i], sizeof(WAVEHDR));
             }
         }
-        waveOutClose(hOut);
-        hOut = nullptr;
+        waveOutClose(ch.hOut);
+        ch.hOut = nullptr;
     }
 
-    bool openDevice(UINT deviceId, DWORD_PTR callback, DWORD fdwOpen,
-                    HWAVEOUT& hOut, WAVEHDR* hdrs, std::vector<uint8_t>* bufs) {
+    bool openChannelDevice(OutputChannel& ch, UINT deviceId) {
         WAVEFORMATEX wfx = makePcmFormat();
-        if (waveOutOpen(&hOut, deviceId, &wfx, callback, 0, fdwOpen) != MMSYSERR_NOERROR) {
-            hOut = nullptr;
+        if (waveOutOpen(&ch.hOut,
+                        deviceId,
+                        &wfx,
+                        reinterpret_cast<DWORD_PTR>(ch.doneEvent),
+                        0,
+                        CALLBACK_EVENT) != MMSYSERR_NOERROR) {
+            ch.hOut = nullptr;
             return false;
         }
 
         for (size_t i = 0; i < kNumBuffers; ++i) {
-            bufs[i].assign(kFrameBytes, 0);
-            std::memset(&hdrs[i], 0, sizeof(WAVEHDR));
-            hdrs[i].lpData = reinterpret_cast<LPSTR>(bufs[i].data());
-            hdrs[i].dwBufferLength = static_cast<DWORD>(kFrameBytes);
+            ch.bufs[i].assign(kOutFrameSamples, 0);
+            std::memset(&ch.hdrs[i], 0, sizeof(WAVEHDR));
+            ch.hdrs[i].lpData = reinterpret_cast<LPSTR>(ch.bufs[i].data());
+            ch.hdrs[i].dwBufferLength = static_cast<DWORD>(kOutFrameBytes);
 
-            if (waveOutPrepareHeader(hOut, &hdrs[i], sizeof(WAVEHDR)) != MMSYSERR_NOERROR) {
-                closeDevice(hOut, hdrs);
+            if (waveOutPrepareHeader(ch.hOut, &ch.hdrs[i], sizeof(WAVEHDR)) != MMSYSERR_NOERROR) {
+                closeChannelDevice(ch);
                 return false;
             }
         }
         return true;
     }
 
-    void writeLoopbackFrame(const uint8_t* frame) {
-        if (!g_loopbackOpen.load(std::memory_order_acquire) || g_loopbackOut == nullptr) {
-            return;
+    void channelWorkerLoop(OutputChannel* ch) {
+        DWORD taskIndex = 0;
+        HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+        if (mmcss == nullptr) {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
         }
-        for (size_t i = 0; i < kNumBuffers; ++i) {
-            if ((g_loopbackHdrs[i].dwFlags & WHDR_INQUEUE) == 0) {
-                std::memcpy(g_loopbackBufs[i].data(), frame, kFrameBytes);
-                waveOutWrite(g_loopbackOut, &g_loopbackHdrs[i], sizeof(WAVEHDR));
-                return;
-            }
-        }
-    }
 
-    void playbackWorker() {
-        uint8_t scratchFrame[kFrameBytes]{};
-
-        // Prime all 4 VB-Cable hardware buffers with initial silence to start the 20 ms clock
+        // Prime all 4 buffers with silence to start the 10 ms completion clock
         for (size_t i = 0; i < kNumBuffers; ++i) {
-            std::memset(g_cableBufs[i].data(), 0, kFrameBytes);
-            if (waveOutWrite(g_cableOut, &g_cableHdrs[i], sizeof(WAVEHDR)) != MMSYSERR_NOERROR) {
-                g_running.store(false, std::memory_order_release);
+            std::fill(ch->bufs[i].begin(), ch->bufs[i].end(), 0);
+            if (waveOutWrite(ch->hOut, &ch->hdrs[i], sizeof(WAVEHDR)) != MMSYSERR_NOERROR) {
+                ch->running.store(false, std::memory_order_release);
                 break;
             }
         }
 
-        while (g_running.load(std::memory_order_acquire)) {
-            // Handle dynamic Loopback toggle safely on the worker thread
-            const bool wantLoopback = g_loopbackRequested.load(std::memory_order_acquire);
-            const bool haveLoopback = g_loopbackOpen.load(std::memory_order_acquire);
-
-            if (wantLoopback && !haveLoopback) {
-                if (openDevice(WAVE_MAPPER, 0, CALLBACK_NULL, g_loopbackOut, g_loopbackHdrs, g_loopbackBufs)) {
-                    g_loopbackOpen.store(true, std::memory_order_release);
-                } else {
-                    g_loopbackRequested.store(false, std::memory_order_release);
-                }
-            } else if (!wantLoopback && haveLoopback) {
-                g_loopbackOpen.store(false, std::memory_order_release);
-                closeDevice(g_loopbackOut, g_loopbackHdrs);
-            }
-
-            // Refill every completed VB-Cable buffer
+        while (ch->running.load(std::memory_order_acquire)) {
             for (size_t i = 0; i < kNumBuffers; ++i) {
-                if (!g_running.load(std::memory_order_acquire)) break;
+                if (!ch->running.load(std::memory_order_acquire)) break;
 
-                if ((g_cableHdrs[i].dwFlags & WHDR_INQUEUE) == 0) {
-                    popFrame(scratchFrame);
-                    std::memcpy(g_cableBufs[i].data(), scratchFrame, kFrameBytes);
-
-                    if (waveOutWrite(g_cableOut, &g_cableHdrs[i], sizeof(WAVEHDR)) != MMSYSERR_NOERROR) {
-                        g_running.store(false, std::memory_order_release);
+                if ((ch->hdrs[i].dwFlags & WHDR_INQUEUE) == 0) {
+                    ch->ring.renderFrame(ch->bufs[i].data(), kOutFrameSamples);
+                    if (waveOutWrite(ch->hOut, &ch->hdrs[i], sizeof(WAVEHDR)) != MMSYSERR_NOERROR) {
+                        ch->running.store(false, std::memory_order_release);
                         break;
                     }
-
-                    writeLoopbackFrame(scratchFrame);
                 }
             }
 
-            if (!g_running.load(std::memory_order_acquire)) break;
-            WaitForSingleObject(g_doneEvent, 25);
+            if (!ch->running.load(std::memory_order_acquire)) break;
+            WaitForSingleObject(ch->doneEvent, 15);
         }
 
-        // Always clean up both handles on exit (closeDevice safely no-ops if nullptr)
-        g_loopbackOpen.store(false, std::memory_order_release);
-        closeDevice(g_loopbackOut, g_loopbackHdrs);
+        ch->open.store(false, std::memory_order_release);
+        closeChannelDevice(*ch);
 
-        g_cableOpen.store(false, std::memory_order_release);
-        closeDevice(g_cableOut, g_cableHdrs);
+        if (mmcss != nullptr) {
+            AvRevertMmThreadCharacteristics(mmcss);
+        }
     }
 
-    void stopInternal() {
-        g_running.store(false, std::memory_order_release);
-        if (g_doneEvent != nullptr) {
-            SetEvent(g_doneEvent);
+    void stopChannelLocked(OutputChannel& ch) {
+        ch.running.store(false, std::memory_order_release);
+        if (ch.doneEvent != nullptr) {
+            SetEvent(ch.doneEvent);
         }
-        if (g_workerThread.joinable()) {
-            g_workerThread.join();
+        if (ch.worker.joinable()) {
+            ch.worker.join();
         }
-        if (g_doneEvent != nullptr) {
-            CloseHandle(g_doneEvent);
-            g_doneEvent = nullptr;
+        if (ch.doneEvent != nullptr) {
+            CloseHandle(ch.doneEvent);
+            ch.doneEvent = nullptr;
         }
-        std::lock_guard<std::mutex> lock(g_ringMutex);
-        clearRingLocked();
+        ch.ring.clear();
+    }
+
+    bool startChannelLocked(OutputChannel& ch, UINT deviceId) {
+        stopChannelLocked(ch);
+
+        ch.doneEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (ch.doneEvent == nullptr) return false;
+
+        if (!openChannelDevice(ch, deviceId)) {
+            CloseHandle(ch.doneEvent);
+            ch.doneEvent = nullptr;
+            return false;
+        }
+
+        ch.ring.clear();
+        ch.ring.resetCounters();
+        ch.open.store(true, std::memory_order_release);
+        ch.running.store(true, std::memory_order_release);
+        ch.worker = std::thread(channelWorkerLoop, &ch);
+        return true;
     }
 
 } // namespace
 
-/// Returns:
-/// 0 = VB-Cable NOT installed
-/// 1 = VB-Cable Ready (both CABLE Input and CABLE Output found)
-/// 2 = Partial (CABLE Input found, CABLE Output disabled/missing)
 AIRCAST_API int32_t audio_check_vbcable() {
     const int playbackId = findCableInputDeviceId();
     if (playbackId < 0) return 0;
     return hasCableOutputRecordingDevice() ? 1 : 2;
 }
 
-/// Initializes VB-Cable playback worker. Safe to call repeatedly (e.g., on Flutter hot restart).
-/// Returns 1 on success, 0 if VB-Cable is missing, -1 if device failed to open.
 AIRCAST_API int32_t audio_init() {
-    std::lock_guard<std::mutex> lock(g_lifecycleMutex);
-    stopInternal();
-
+    std::lock_guard<std::mutex> lock(g_cable.lifecycleMutex);
     const int cableId = findCableInputDeviceId();
     if (cableId < 0) {
+        stopChannelLocked(g_cable);
         return 0;
     }
 
-    g_doneEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (g_doneEvent == nullptr) {
+    setTimerPeriod(true);
+    if (!startChannelLocked(g_cable, static_cast<UINT>(cableId))) {
         return -1;
     }
-
-    if (!openDevice(static_cast<UINT>(cableId),
-                    reinterpret_cast<DWORD_PTR>(g_doneEvent),
-                    CALLBACK_EVENT,
-                    g_cableOut,
-                    g_cableHdrs,
-                    g_cableBufs)) {
-        CloseHandle(g_doneEvent);
-        g_doneEvent = nullptr;
-        return -1;
-    }
-
-    g_underruns.store(0, std::memory_order_relaxed);
-    g_cableOpen.store(true, std::memory_order_release);
-    g_running.store(true, std::memory_order_release);
-    g_workerThread = std::thread(playbackWorker);
     return 1;
 }
 
 AIRCAST_API void audio_push(const uint8_t* data, int32_t length) {
     if (length <= 0 || data == nullptr) return;
-    pushRing(data, static_cast<size_t>(length));
+    const size_t byteLen = static_cast<size_t>(length);
+    if (g_cable.open.load(std::memory_order_acquire)) {
+        g_cable.ring.pushBytes(data, byteLen);
+    }
+    if (g_loopback.open.load(std::memory_order_acquire)) {
+        g_loopback.ring.pushBytes(data, byteLen);
+    }
 }
 
 AIRCAST_API void audio_flush() {
-    std::lock_guard<std::mutex> lock(g_ringMutex);
-    clearRingLocked();
+    g_cable.ring.clear();
+    g_loopback.ring.clear();
 }
 
 AIRCAST_API void audio_set_loopback(int32_t enabled) {
-    g_loopbackRequested.store(enabled != 0, std::memory_order_release);
-    if (g_doneEvent != nullptr) {
-        SetEvent(g_doneEvent);
+    std::lock_guard<std::mutex> lock(g_loopback.lifecycleMutex);
+    if (enabled != 0) {
+        if (!g_loopback.open.load(std::memory_order_acquire)) {
+            setTimerPeriod(true);
+            startChannelLocked(g_loopback, WAVE_MAPPER);
+        }
+    } else {
+        stopChannelLocked(g_loopback);
     }
 }
 
 AIRCAST_API int32_t audio_is_cable_active() {
-    return g_cableOpen.load(std::memory_order_acquire) ? 1 : 0;
+    return g_cable.open.load(std::memory_order_acquire) ? 1 : 0;
 }
 
 AIRCAST_API int32_t audio_is_loopback_active() {
-    return g_loopbackOpen.load(std::memory_order_acquire) ? 1 : 0;
+    return g_loopback.open.load(std::memory_order_acquire) ? 1 : 0;
 }
 
 AIRCAST_API int32_t audio_get_buffered_ms() {
-    std::lock_guard<std::mutex> lock(g_ringMutex);
-    return static_cast<int32_t>((g_available * 1000) / kBytesPerSec);
+    return g_cable.ring.bufferedMs();
 }
 
 AIRCAST_API int32_t audio_get_underruns() {
-    return static_cast<int32_t>(g_underruns.load(std::memory_order_relaxed));
+    return static_cast<int32_t>(g_cable.ring.underruns());
+}
+
+AIRCAST_API int32_t audio_get_overruns() {
+    return static_cast<int32_t>(g_cable.ring.overruns());
 }
 
 AIRCAST_API void audio_stop() {
-    std::lock_guard<std::mutex> lock(g_lifecycleMutex);
-    stopInternal();
+    {
+        std::lock_guard<std::mutex> lock(g_loopback.lifecycleMutex);
+        stopChannelLocked(g_loopback);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_cable.lifecycleMutex);
+        stopChannelLocked(g_cable);
+    }
+    setTimerPeriod(false);
 }
 
 BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID) {
 if (reason == DLL_PROCESS_DETACH) {
-g_running.store(false, std::memory_order_release);
-if (g_doneEvent != nullptr) SetEvent(g_doneEvent);
+g_loopback.running.store(false, std::memory_order_release);
+g_cable.running.store(false, std::memory_order_release);
+if (g_loopback.doneEvent != nullptr) SetEvent(g_loopback.doneEvent);
+if (g_cable.doneEvent != nullptr) SetEvent(g_cable.doneEvent);
 }
 return TRUE;
 }
