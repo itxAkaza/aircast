@@ -20,10 +20,12 @@ class ClientController extends GetxController {
   }) async {
     if (isConnecting.value) return;
     isConnecting.value = true;
-    _log('Connecting to $host:$port...');
+    log('Connecting to $host:$port...');
 
     try {
       await _socket?.close();
+      _decoder.reset();
+
       final socket = await Socket.connect(
         host,
         port,
@@ -39,26 +41,53 @@ class ClientController extends GetxController {
           }
         },
         onError: (e) {
-          _log('Connection error: $e');
+          log('Connection error: $e');
           _resetState();
         },
         onDone: () {
-          _log('Disconnected from server');
+          log('Disconnected from server');
           _resetState();
         },
       );
 
-      // Send handshake
-      socket.add(PacketFramer.encodeControl({
+      sendControl({
         'cmd': 'handshake',
         'token': token.trim(),
         'device': Platform.localHostname,
-      }));
+      });
     } catch (e) {
-      _log('Failed to connect: $e');
+      log('Failed to connect: $e');
       _resetState();
     } finally {
       isConnecting.value = false;
+    }
+  }
+
+  /// Sends a control JSON packet safely.
+  bool sendControl(Map<String, dynamic> json) {
+    final socket = _socket;
+    if (socket == null) return false;
+    try {
+      socket.add(PacketFramer.encodeControl(json));
+      return true;
+    } catch (e) {
+      log('Control send error: $e');
+      _resetState();
+      return false;
+    }
+  }
+
+  /// Sends a raw 16-bit PCM audio frame over the active TCP socket.
+  bool sendAudioFrame(Uint8List pcmBytes) {
+    final socket = _socket;
+    if (!isConnected.value || socket == null) return false;
+    try {
+      socket.add(PacketFramer.encode(PacketType.audio, pcmBytes));
+      return true;
+    } catch (e) {
+      log('Audio send error: $e');
+      _resetState();
+      return false;
     }
   }
 
@@ -71,10 +100,10 @@ class ClientController extends GetxController {
       if (msg['ok'] == true) {
         isConnected.value = true;
         serverName.value = (msg['server'] as String?) ?? 'Windows PC';
-        _log('Connected to ${serverName.value}');
+        log('Connected to ${serverName.value}');
         sendPing();
       } else {
-        _log('Handshake rejected: ${msg['error']}');
+        log('Handshake rejected: ${msg['error']}');
         disconnect();
       }
     } else if (cmd == 'pong') {
@@ -82,15 +111,15 @@ class ClientController extends GetxController {
       if (sentTs != null) {
         final rtt = DateTime.now().millisecondsSinceEpoch - sentTs;
         lastPingMs.value = rtt;
-        _log('Pong received — Latency: $rtt ms');
+        log('Pong received — Latency: $rtt ms');
       }
     }
   }
 
   void sendPing() {
-    if (!isConnected.value || _socket == null) return;
+    if (!isConnected.value) return;
     final now = DateTime.now().millisecondsSinceEpoch;
-    _socket!.add(PacketFramer.encodeControl({'cmd': 'ping', 'ts': now}));
+    sendControl({'cmd': 'ping', 'ts': now});
   }
 
   void disconnect() {
@@ -100,15 +129,16 @@ class ClientController extends GetxController {
 
   void _resetState() {
     _socket = null;
+    _decoder.reset();
     isConnected.value = false;
     serverName.value = '';
     lastPingMs.value = null;
   }
 
-  void _log(String text) {
+  void log(String text) {
     final time = DateTime.now().toIso8601String().substring(11, 19);
     logs.insert(0, '[$time] $text');
-    if (logs.length > 40) logs.removeLast();
+    if (logs.length > 50) logs.removeLast();
   }
 
   @override

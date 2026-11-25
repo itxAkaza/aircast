@@ -3,6 +3,7 @@ import 'package:get/get.dart';
 import 'package:shared_protocol/shared_protocol.dart';
 
 import '../controller/client_controller.dart';
+import 'mic_test_screen.dart';
 import 'qr_scanner_screen.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -34,7 +35,7 @@ class _HomeScreenState extends State<HomeScreen> {
       backgroundColor: const Color(0xFF0E0E10),
       appBar: AppBar(
         backgroundColor: const Color(0xFF16161A),
-        title: const Text('AirCast Phone — Phase 1'),
+        title: const Text('AirCast Phone — Phase 2A'),
       ),
       body: Padding(
         padding: const EdgeInsets.all(20),
@@ -85,8 +86,9 @@ class _HomeScreenState extends State<HomeScreen> {
                 onPressed: c.isConnecting.value
                     ? null
                     : () async {
-                  final result =
-                  await Get.to<PairingPayload?>(() => const QrScannerScreen());
+                  final result = await Get.to<PairingPayload?>(
+                        () => const QrScannerScreen(),
+                  );
                   if (result != null) {
                     _ipCtrl.text = result.host;
                     _portCtrl.text = result.port.toString();
@@ -102,8 +104,10 @@ class _HomeScreenState extends State<HomeScreen> {
                 label: const Text('Scan Desktop QR Code'),
               ),
               const SizedBox(height: 16),
-              const Text('Or Connect Manually:',
-                  style: TextStyle(color: Colors.white70)),
+              const Text(
+                'Or Connect Manually:',
+                style: TextStyle(color: Colors.white70),
+              ),
               const SizedBox(height: 8),
               TextField(
                 controller: _ipCtrl,
@@ -149,7 +153,10 @@ class _HomeScreenState extends State<HomeScreen> {
                   token: _pinCtrl.text.trim(),
                 ),
                 child: Text(
-                    c.isConnecting.value ? 'Connecting...' : 'Connect Manually'),
+                  c.isConnecting.value
+                      ? 'Connecting...'
+                      : 'Connect Manually',
+                ),
               ),
             ] else ...[
               Row(
@@ -165,7 +172,8 @@ class _HomeScreenState extends State<HomeScreen> {
                   Expanded(
                     child: FilledButton.icon(
                       style: FilledButton.styleFrom(
-                          backgroundColor: Colors.redAccent),
+                        backgroundColor: Colors.redAccent,
+                      ),
                       onPressed: c.disconnect,
                       icon: const Icon(Icons.link_off),
                       label: const Text('Disconnect'),
@@ -173,11 +181,44 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ],
               ),
+              const SizedBox(height: 14),
+              const Text(
+                'Select Stream Mode',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: () => Get.to(() => const MicTestScreen()),
+                      icon: const Icon(Icons.mic),
+                      label: const Text('Mic Only'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: OutlinedButton(
+                      onPressed: null,
+                      child: Text('Cam (Ph 3)'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: OutlinedButton(
+                      onPressed: null,
+                      child: Text('Both (Ph 3)'),
+                    ),
+                  ),
+                ],
+              ),
             ],
 
             const SizedBox(height: 16),
-            const Text('Logs',
-                style: TextStyle(fontWeight: FontWeight.bold)),
+            const Text(
+              'Logs',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
             const SizedBox(height: 6),
             Expanded(
               child: Container(
