@@ -16,6 +16,14 @@ class ServerController extends GetxController {
   final RxString connectedDevice = ''.obs;
   final RxList<String> logs = <String>[].obs;
 
+  /// Synced live from the connected phone.
+  final Rx<AudioConfig> remoteAudioConfig = const AudioConfig().obs;
+  final RxBool remoteAudioStreaming = false.obs;
+
+  /// Hook for MicMonitorController (and Phase 2B C++ audio router).
+  void Function(Uint8List pcmBytes)? onAudioPacket;
+  void Function()? onAudioReconfig;
+
   ServerSocket? _server;
   Socket? _client;
   final PacketDecoder _decoder = PacketDecoder();
@@ -58,7 +66,6 @@ class ServerController extends GetxController {
       }
     }
 
-    // Prioritize standard LAN subnets (192.168.x.x, 10.x.x.x) first
     ips.sort((a, b) {
       final aLan = a.startsWith('192.168.') || a.startsWith('10.') ? 0 : 1;
       final bLan = b.startsWith('192.168.') || b.startsWith('10.') ? 0 : 1;
@@ -76,20 +83,20 @@ class ServerController extends GetxController {
       await _server?.close();
       _server = await ServerSocket.bind(InternetAddress.anyIPv4, port.value);
       isServerRunning.value = true;
-      _log('TCP Server listening on port ${port.value}');
+      log('TCP Server listening on port ${port.value}');
 
       _server!.listen(_handleClientConnection);
     } catch (e) {
-      _log('Server start failed: $e');
+      log('Server start failed: $e');
     }
   }
 
   void _handleClientConnection(Socket socket) {
     final remote = '${socket.remoteAddress.address}:${socket.remotePort}';
-    _log('Incoming connection from $remote');
+    log('Incoming connection from $remote');
 
-    // Replace any stale connection
     _client?.destroy();
+    _decoder.reset();
     _client = socket;
     socket.setOption(SocketOption.tcpNoDelay, true);
 
@@ -100,17 +107,22 @@ class ServerController extends GetxController {
         }
       },
       onError: (e) {
-        _log('Socket error: $e');
+        log('Socket error: $e');
         _resetClient();
       },
       onDone: () {
-        _log('Client disconnected ($remote)');
+        log('Client disconnected ($remote)');
         _resetClient();
       },
     );
   }
 
   void _handlePacket(AirCastPacket packet, Socket socket) {
+    if (packet.type == PacketType.audio) {
+      onAudioPacket?.call(packet.payload);
+      return;
+    }
+
     if (packet.type != PacketType.control) return;
 
     final msg = packet.toJson();
@@ -121,7 +133,7 @@ class ServerController extends GetxController {
       final device = msg['device'] as String? ?? 'Android Device';
 
       if (token != pairingToken.value) {
-        _log('Rejected $device: invalid PIN');
+        log('Rejected $device: invalid PIN');
         socket.add(PacketFramer.encodeControl({
           'cmd': 'handshake_ack',
           'ok': false,
@@ -134,7 +146,7 @@ class ServerController extends GetxController {
 
       isClientConnected.value = true;
       connectedDevice.value = device;
-      _log('Paired with $device');
+      log('Paired with $device');
 
       socket.add(PacketFramer.encodeControl({
         'cmd': 'handshake_ack',
@@ -143,27 +155,46 @@ class ServerController extends GetxController {
       }));
     } else if (cmd == 'ping') {
       final ts = msg['ts'];
-      _log('Ping received -> sending Pong');
+      log('Ping received -> sending Pong');
       socket.add(PacketFramer.encodeControl({'cmd': 'pong', 'ts': ts}));
+    } else if (cmd == 'audio_config') {
+      final cfgMap = msg['config'] as Map<String, dynamic>?;
+      if (cfgMap != null) {
+        remoteAudioConfig.value = AudioConfig.fromJson(cfgMap);
+        log('Audio config: ${remoteAudioConfig.value.sampleRate}Hz, '
+            'gain=${remoteAudioConfig.value.gain}x, '
+            'muted=${remoteAudioConfig.value.isMuted}, '
+            'NC=${remoteAudioConfig.value.noiseSuppression}');
+      }
+    } else if (cmd == 'audio_state') {
+      final streaming = (msg['streaming'] as bool?) ?? false;
+      remoteAudioStreaming.value = streaming;
+      log(streaming ? 'Phone started mic stream' : 'Phone stopped mic stream');
+    } else if (cmd == 'audio_reconfig') {
+      onAudioReconfig?.call();
+      log('Phone reconfiguring mic filters');
     }
   }
 
   void disconnectClient() {
     _client?.destroy();
     _resetClient();
-    _log('Disconnected client manually');
+    log('Disconnected client manually');
   }
 
   void _resetClient() {
     _client = null;
+    _decoder.reset();
     isClientConnected.value = false;
     connectedDevice.value = '';
+    remoteAudioStreaming.value = false;
+    remoteAudioConfig.value = const AudioConfig();
   }
 
-  void _log(String text) {
+  void log(String text) {
     final time = DateTime.now().toIso8601String().substring(11, 19);
     logs.insert(0, '[$time] $text');
-    if (logs.length > 50) logs.removeLast();
+    if (logs.length > 60) logs.removeLast();
   }
 
   @override
