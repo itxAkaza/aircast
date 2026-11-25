@@ -24,15 +24,16 @@ namespace {
     constexpr uint16_t kBitsPerSample = 16;
     constexpr uint32_t kBytesPerSec = kSampleRate * kChannels * (kBitsPerSample / 8); // 96,000 B/s
 
-    constexpr size_t kOutFrameSamples = 480;              // 10 ms @ 48 kHz
+    constexpr size_t kOutFrameSamples = 960;              // 20 ms @ 48 kHz (matches phone 1:1)
     constexpr size_t kOutFrameBytes = kOutFrameSamples * 2;
-    constexpr size_t kNumBuffers = 4;                     // 40 ms hardware queue
+    constexpr size_t kNumBuffers = 4;                     // 80 ms hardware queue (rock-solid on winmm)
     constexpr size_t kFadeSamples = 128;                  // ~2.7 ms click-free ramp
 
     constexpr size_t kRingSamples = 24000;                // 500 ms ring capacity
-    constexpr size_t kTargetSamples = 2400;               // 50 ms steady-state target
-    constexpr size_t kPrebufferSamples = 2400;            // 50 ms initial prebuffer
-    constexpr size_t kHardCapSamples = 9600;              // 200 ms emergency overflow cap
+    constexpr size_t kTargetSamples = 2880;               // 60 ms steady-state cushion (3 packets)
+    constexpr size_t kPrebufferSamples = 2880;            // 60 ms recovery cushion on start/underrun
+    constexpr size_t kHardCapSamples = 10560;             // 220 ms emergency overflow cap
+    constexpr size_t kTrimTargetSamples = 3840;           // 80 ms after emergency trim
 
     class SampleRing {
     public:
@@ -42,7 +43,6 @@ namespace {
             writePos_ = 0;
             count_ = 0;
             prebuffering_ = true;
-            consecutiveUnderruns_ = 0;
             fracPos_ = 0.0;
             smoothErr_ = 0.0;
             lastSample_ = 0;
@@ -82,18 +82,18 @@ namespace {
             writePos_ = (writePos_ + numSamples) % kRingSamples;
             count_ += numSamples;
 
-            // Emergency cap only if Wi-Fi stalled > 200 ms and dumped a huge backlog
+            // Emergency cap only if Wi-Fi stalled > 220 ms and dumped a backlog
             if (count_ > kHardCapSamples) {
-                const size_t drop = count_ - kTargetSamples;
+                const size_t drop = count_ - kTrimTargetSamples;
                 readPos_ = (readPos_ + drop) % kRingSamples;
                 count_ -= drop;
                 fracPos_ = 0.0;
+                smoothErr_ = 0.0;
                 overruns_.fetch_add(1, std::memory_order_relaxed);
             }
 
             if (prebuffering_ && count_ >= kPrebufferSamples) {
                 prebuffering_ = false;
-                consecutiveUnderruns_ = 0;
             }
         }
 
@@ -105,45 +105,60 @@ namespace {
                 return false;
             }
 
-            // Smooth PI-style drift control: nudges speed by up to ±0.6% (~10 cents, inaudible)
+            // Smooth drift tracker with a deadband: bit-exact 1.0x when within ±20 ms of target
             const double err = (static_cast<double>(count_) - static_cast<double>(kTargetSamples)) /
                                static_cast<double>(kTargetSamples);
-            smoothErr_ = 0.98 * smoothErr_ + 0.02 * err;
-            const double delta = std::clamp(smoothErr_ * 0.006, -0.006, 0.006);
-            const double ratio = 1.0 + delta;
+            smoothErr_ = 0.96 * smoothErr_ + 0.04 * err;
 
-            const size_t needed = static_cast<size_t>(std::ceil(fracPos_ + outSamples * ratio)) + 2;
+            double ratio = 1.0;
+            if (std::abs(smoothErr_) > 0.35) {
+                const double excess = (smoothErr_ > 0.0) ? (smoothErr_ - 0.35) : (smoothErr_ + 0.35);
+                ratio = 1.0 + std::clamp(excess * 0.005, -0.005, 0.005);
+            }
+
+            const bool bitExact = (ratio == 1.0 && fracPos_ < 1e-6);
+            const size_t needed = bitExact
+                                  ? outSamples
+                                  : (static_cast<size_t>(std::ceil(fracPos_ + outSamples * ratio)) + 2);
+
             if (count_ < needed) {
+                // Rebuild a clean 60 ms cushion instead of stuttering at 0 ms
                 underruns_.fetch_add(1, std::memory_order_relaxed);
-                consecutiveUnderruns_++;
+                prebuffering_ = true;
                 wasUnderrun_ = true;
-
-                // Only re-prebuffer after 100 ms continuous dropout, not on a 10 ms hiccup
-                if (consecutiveUnderruns_ >= 10) {
-                    prebuffering_ = true;
-                }
+                fracPos_ = 0.0;
+                smoothErr_ = 0.0;
                 writeFadeOutSilence(out, outSamples);
                 return false;
             }
 
-            consecutiveUnderruns_ = 0;
-            double pos = fracPos_;
-
-            for (size_t i = 0; i < outSamples; ++i) {
-                const size_t idx0 = static_cast<size_t>(pos);
-                const double frac = pos - static_cast<double>(idx0);
-                const int16_t s0 = buf_[(readPos_ + idx0) % kRingSamples];
-                const int16_t s1 = buf_[(readPos_ + idx0 + 1) % kRingSamples];
-                const double interp = static_cast<double>(s0) +
-                                      (static_cast<double>(s1) - static_cast<double>(s0)) * frac;
-                out[i] = static_cast<int16_t>(std::clamp(std::lround(interp), -32768L, 32767L));
-                pos += ratio;
+            if (bitExact) {
+                const size_t firstPart = std::min(outSamples, kRingSamples - readPos_);
+                std::memcpy(out, buf_ + readPos_, firstPart * sizeof(int16_t));
+                if (firstPart < outSamples) {
+                    std::memcpy(out + firstPart, buf_, (outSamples - firstPart) * sizeof(int16_t));
+                }
+                readPos_ = (readPos_ + outSamples) % kRingSamples;
+                count_ -= outSamples;
+                fracPos_ = 0.0;
+            } else {
+                double pos = fracPos_;
+                for (size_t i = 0; i < outSamples; ++i) {
+                    const size_t idx0 = static_cast<size_t>(pos);
+                    const double frac = pos - static_cast<double>(idx0);
+                    const int16_t s0 = buf_[(readPos_ + idx0) % kRingSamples];
+                    const int16_t s1 = buf_[(readPos_ + idx0 + 1) % kRingSamples];
+                    const double interp = static_cast<double>(s0) +
+                                          (static_cast<double>(s1) - static_cast<double>(s0)) * frac;
+                    out[i] = static_cast<int16_t>(std::clamp(std::lround(interp), -32768L, 32767L));
+                    pos += ratio;
+                }
+                const size_t consumed = static_cast<size_t>(pos);
+                readPos_ = (readPos_ + consumed) % kRingSamples;
+                count_ -= consumed;
+                fracPos_ = pos - static_cast<double>(consumed);
+                if (fracPos_ < 1e-6) fracPos_ = 0.0;
             }
-
-            const size_t consumed = static_cast<size_t>(pos);
-            readPos_ = (readPos_ + consumed) % kRingSamples;
-            count_ -= consumed;
-            fracPos_ = pos - static_cast<double>(consumed);
 
             if (wasUnderrun_) {
                 const size_t ramp = std::min(kFadeSamples, outSamples);
@@ -185,7 +200,6 @@ namespace {
         size_t writePos_ = 0;
         size_t count_ = 0;
         bool prebuffering_ = true;
-        int consecutiveUnderruns_ = 0;
         double fracPos_ = 0.0;
         double smoothErr_ = 0.0;
         int16_t lastSample_ = 0;
@@ -305,7 +319,7 @@ namespace {
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
         }
 
-        // Prime all 4 buffers with silence to start the 10 ms completion clock
+        // Prime all 4 buffers with silence to start the 20 ms completion clock
         for (size_t i = 0; i < kNumBuffers; ++i) {
             std::fill(ch->bufs[i].begin(), ch->bufs[i].end(), 0);
             if (waveOutWrite(ch->hOut, &ch->hdrs[i], sizeof(WAVEHDR)) != MMSYSERR_NOERROR) {
@@ -328,7 +342,7 @@ namespace {
             }
 
             if (!ch->running.load(std::memory_order_acquire)) break;
-            WaitForSingleObject(ch->doneEvent, 15);
+            WaitForSingleObject(ch->doneEvent, 25);
         }
 
         ch->open.store(false, std::memory_order_release);
