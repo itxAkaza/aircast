@@ -31,8 +31,8 @@ class AudioConfig {
     this.numChannels = defaultChannels,
     this.gain = 1.0,
     this.isMuted = false,
-    this.noiseSuppression = true,
-    this.echoCancellation = true,
+    this.noiseSuppression = false,
+    this.echoCancellation = false,
     this.mode = StreamMode.mic,
   });
 
@@ -57,14 +57,14 @@ class AudioConfig {
   }
 
   Map<String, dynamic> toJson() => {
-        'sampleRate': sampleRate,
-        'numChannels': numChannels,
-        'gain': double.parse(gain.toStringAsFixed(2)),
-        'isMuted': isMuted,
-        'noiseSuppression': noiseSuppression,
-        'echoCancellation': echoCancellation,
-        'mode': mode.name,
-      };
+    'sampleRate': sampleRate,
+    'numChannels': numChannels,
+    'gain': double.parse(gain.toStringAsFixed(2)),
+    'isMuted': isMuted,
+    'noiseSuppression': noiseSuppression,
+    'echoCancellation': echoCancellation,
+    'mode': mode.name,
+  };
 
   factory AudioConfig.fromJson(Map<String, dynamic> json) {
     return AudioConfig(

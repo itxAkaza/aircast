@@ -1,4 +1,5 @@
 import 'dart:convert';
+
 import 'constants.dart';
 
 class PairingPayload {
@@ -15,12 +16,12 @@ class PairingPayload {
   });
 
   String toJsonString() => jsonEncode({
-        'app': 'aircast',
-        'v': version,
-        'host': host,
-        'port': port,
-        'token': token,
-      });
+    'app': 'aircast',
+    'v': version,
+    'host': host,
+    'port': port,
+    'token': token,
+  });
 
   static PairingPayload? tryParse(String raw) {
     try {
