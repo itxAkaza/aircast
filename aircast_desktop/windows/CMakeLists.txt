@@ -106,3 +106,13 @@ install(DIRECTORY "${PROJECT_BUILD_DIR}/${FLUTTER_ASSET_DIR_NAME}"
 install(FILES "${AOT_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"
   CONFIGURATIONS Profile;Release
   COMPONENT Runtime)
+
+# === AirCast Native C++ Audio Router DLL ===
+add_library(aircast_audio SHARED
+        "runner/aircast_audio.cpp"
+)
+target_link_libraries(aircast_audio PRIVATE winmm avrt)
+add_dependencies(${BINARY_NAME} aircast_audio)
+
+install(TARGETS aircast_audio RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}"
+        COMPONENT Runtime)

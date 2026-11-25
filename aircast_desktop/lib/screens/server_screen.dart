@@ -1,8 +1,8 @@
 import 'package:aircast_desktop/controller/server_controller.dart';
+import 'package:aircast_desktop/screens/mic_monitor_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:qr_flutter/qr_flutter.dart';
-
 
 class ServerScreen extends StatelessWidget {
   const ServerScreen({super.key});
@@ -15,8 +15,16 @@ class ServerScreen extends StatelessWidget {
       backgroundColor: const Color(0xFF0E0E10),
       appBar: AppBar(
         backgroundColor: const Color(0xFF16161A),
-        title: const Text('AirCast Desktop — Phase 1'),
+        title: const Text('AirCast Desktop — Phase 2A'),
         actions: [
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: FilledButton.icon(
+              onPressed: () => Get.to(() => const MicMonitorScreen()),
+              icon: const Icon(Icons.graphic_eq, size: 18),
+              label: const Text('Mic Monitor'),
+            ),
+          ),
           IconButton(
             tooltip: 'Refresh Network IPs',
             icon: const Icon(Icons.refresh),
@@ -172,7 +180,8 @@ class _StatusBadge extends StatelessWidget {
         children: [
           Icon(Icons.circle, size: 10, color: color),
           const SizedBox(width: 8),
-          Text(label, style: TextStyle(color: color, fontWeight: FontWeight.w600)),
+          Text(label,
+              style: TextStyle(color: color, fontWeight: FontWeight.w600)),
         ],
       ),
     );
