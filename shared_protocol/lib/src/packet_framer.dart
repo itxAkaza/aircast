@@ -33,6 +33,9 @@ class PacketFramer {
 class PacketDecoder {
   final BytesBuilder _buffer = BytesBuilder(copy: false);
 
+  /// Clears leftover partial bytes when a socket reconnects.
+  void reset() => _buffer.clear();
+
   List<AirCastPacket> addChunk(Uint8List chunk) {
     _buffer.add(chunk);
     final packets = <AirCastPacket>[];
