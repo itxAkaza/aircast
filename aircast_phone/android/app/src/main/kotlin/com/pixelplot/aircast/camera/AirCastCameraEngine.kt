@@ -29,6 +29,7 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.core.SurfaceOrientedMeteringPointFactory
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -61,7 +62,6 @@ class AirCastCameraEngine {
         private const val MAX_FRAME_BYTES = 4 * 1024 * 1024
         private const val REQ_CAMERA_PERM = 4821
 
-
         @Volatile
         var instance: AirCastCameraEngine = AirCastCameraEngine()
     }
@@ -70,7 +70,8 @@ class AirCastCameraEngine {
         val cameraId: String,
         val label: String,
         val isFront: Boolean,
-        val selector: CameraSelector
+        val selector: CameraSelector,
+        val fpsRanges: Array<Range<Int>>
     )
 
     private data class EncodedFrame(
@@ -84,7 +85,12 @@ class AirCastCameraEngine {
     )
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val analysisExecutor = Executors.newSingleThreadExecutor()
+    private val analysisExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "AirCast-Analysis").apply { priority = Thread.NORM_PRIORITY + 1 }
+    }
+    private val encodeExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "AirCast-Encode").apply { priority = Thread.NORM_PRIORITY + 1 }
+    }
 
     @Volatile private var activityRef: Activity? = null
     @Volatile private var textureRegistry: TextureRegistry? = null
@@ -104,29 +110,43 @@ class AirCastCameraEngine {
     private val previewRunning = AtomicBoolean(false)
     private val streamingActive = AtomicBoolean(false)
     private val inPipMode = AtomicBoolean(false)
+    private val previewRotation = AtomicInteger(90)
 
-    // Reusable per-frame buffers (zero per-frame GC churn on analysisExecutor)
-    private var nv21Scratch = ByteArray(0)
-    private val jpegStream = ByteArrayOutputStream(128 * 1024)
+    // Ping-pong NV21 buffers (thread-safe handoff between analysisExecutor & encodeExecutor)
+    private val encBusy = AtomicBoolean(false)
+    private val nv21Bufs = arrayOf(ByteArray(0), ByteArray(0))
+    private var nv21Idx = 0 // accessed exclusively on analysisExecutor
+    private var uRow = ByteArray(0) // accessed exclusively on analysisExecutor
+    private var vRow = ByteArray(0) // accessed exclusively on analysisExecutor
+    private val jpegStream = ByteArrayOutputStream(256 * 1024) // accessed exclusively on encodeExecutor
 
     // 1-slot latest-frame-wins queue for Port 4821 TCP sender
     private val latestPendingFrame = AtomicReference<EncodedFrame?>(null)
     private val senderSignal = Object()
     private val senderRunning = AtomicBoolean(false)
+    private val senderGen = AtomicInteger(0)
     @Volatile private var senderThread: Thread? = null
     @Volatile private var videoSocket: Socket? = null
     @Volatile private var currentHost: String = ""
     @Volatile private var currentPort: Int = 4821
     @Volatile private var currentSessionToken: String = ""
 
-    // Telemetry counters
+    // Telemetry counters & stage EMA timings (microseconds)
     private val seqCounter = AtomicInteger(0)
     private val capturedCount = AtomicInteger(0)
     private val sentCount = AtomicInteger(0)
     private val droppedCount = AtomicInteger(0)
     private val totalBytesSent = AtomicLong(0)
+    private val convUs = AtomicLong(0)
+    private val jpegUs = AtomicLong(0)
+    private val sendUs = AtomicLong(0)
     private val lastError = AtomicReference("")
     private val textureId = AtomicLong(-1L)
+
+    private fun updateEma(target: AtomicLong, sampleUs: Long) {
+        val prev = target.get()
+        target.set(if (prev == 0L) sampleUs else (prev * 7 + sampleUs) / 8)
+    }
 
     fun attach(activity: Activity, registry: TextureRegistry) {
         activityRef = activity
@@ -166,26 +186,23 @@ class AirCastCameraEngine {
 
         targetWidth = width.coerceIn(320, 1920)
         targetHeight = height.coerceIn(240, 1080)
-        targetFps = fps.coerceIn(15, 30)
+        targetFps = fps.coerceIn(15, 60)
         baseJpegQuality = quality.coerceIn(40, 95)
         effectiveJpegQuality.set(baseJpegQuality)
         activeLensIndex = lensIdx.coerceAtLeast(0)
         lastError.set("")
 
-        // Create Flutter SurfaceProducer safely on the main thread (supports Flutter 3.50 merged UI/Platform thread)
         var producer = surfaceProducer
         if (producer == null) {
             val reg = textureRegistry ?: return -1L
             val createProducer = {
                 val created = reg.createSurfaceProducer()
-                created.setSize(targetWidth, targetHeight)
+                created.setSize(minOf(targetWidth, 1280), minOf(targetHeight, 720))
                 created.setCallback(object : TextureRegistry.SurfaceProducer.Callback {
                     override fun onSurfaceAvailable() {
                         if (previewRunning.get()) bindCameraUseCases()
                     }
-                    override fun onSurfaceCleanup() {
-                        // CameraX Preview cleanly releases surface when unbound/rebound
-                    }
+                    override fun onSurfaceCleanup() {}
                 })
                 surfaceProducer = created
                 textureId.set(created.id())
@@ -206,10 +223,12 @@ class AirCastCameraEngine {
             }
             producer = surfaceProducer
         } else {
+            val pw = minOf(targetWidth, 1280)
+            val ph = minOf(targetHeight, 720)
             if (Looper.myLooper() == Looper.getMainLooper()) {
-                producer.setSize(targetWidth, targetHeight)
+                producer.setSize(pw, ph)
             } else {
-                mainHandler.post { producer.setSize(targetWidth, targetHeight) }
+                mainHandler.post { producer.setSize(pw, ph) }
             }
         }
 
@@ -267,13 +286,17 @@ class AirCastCameraEngine {
         sentCount.set(0)
         droppedCount.set(0)
         totalBytesSent.set(0)
+        convUs.set(0)
+        jpegUs.set(0)
+        sendUs.set(0)
         effectiveJpegQuality.set(baseJpegQuality)
         lastError.set("")
 
         streamingActive.set(true)
         syncPipParams()
         senderRunning.set(true)
-        senderThread = Thread({ senderLoop() }, "AirCast-VideoSender").apply {
+        val gen = senderGen.incrementAndGet()
+        senderThread = Thread({ senderLoop(gen) }, "AirCast-VideoSender-$gen").apply {
             priority = Thread.NORM_PRIORITY + 1
             start()
         }
@@ -283,6 +306,7 @@ class AirCastCameraEngine {
     fun stopStreaming() {
         streamingActive.set(false)
         syncPipParams()
+        senderGen.incrementAndGet()
         senderRunning.set(false)
         synchronized(senderSignal) {
             latestPendingFrame.set(null)
@@ -302,7 +326,6 @@ class AirCastCameraEngine {
         if (lenses.isEmpty()) return
         activeLensIndex = index.coerceIn(0, lenses.lastIndex)
         val entry = lenses[activeLensIndex]
-        // Default mirror ON for front camera, OFF for rear camera
         mirrorHorizontal.set(entry.isFront)
         if (entry.isFront) torchEnabled.set(false)
         if (previewRunning.get()) {
@@ -313,12 +336,12 @@ class AirCastCameraEngine {
     fun applyPreset(width: Int, height: Int, fps: Int, quality: Int) {
         targetWidth = width.coerceIn(320, 1920)
         targetHeight = height.coerceIn(240, 1080)
-        targetFps = fps.coerceIn(15, 30)
+        targetFps = fps.coerceIn(15, 60)
         baseJpegQuality = quality.coerceIn(40, 95)
         effectiveJpegQuality.set(baseJpegQuality)
         if (previewRunning.get()) {
             mainHandler.post {
-                surfaceProducer?.setSize(targetWidth, targetHeight)
+                surfaceProducer?.setSize(minOf(targetWidth, 1280), minOf(targetHeight, 720))
                 bindCameraUseCases()
             }
         }
@@ -428,8 +451,9 @@ class AirCastCameraEngine {
 
     fun readIsInPipMode(): Boolean = inPipMode.get()
 
-    // Telemetry & capability readers (no get/is/set prefix -> clean JNIgen methods)
+    // Telemetry & capability readers
     fun readTextureId(): Long = textureId.get()
+    fun readPreviewRotation(): Int = previewRotation.get()
     fun readLensCount(): Int = lenses.size
     fun readLensLabel(index: Int): String = lenses.getOrNull(index)?.label ?: "Camera"
     fun readActiveLensIndex(): Int = activeLensIndex
@@ -441,6 +465,9 @@ class AirCastCameraEngine {
     fun readSentTotal(): Int = sentCount.get()
     fun readDroppedTotal(): Int = droppedCount.get()
     fun readBytesSentTotal(): Long = totalBytesSent.get()
+    fun readConvUs(): Long = convUs.get()
+    fun readJpegUs(): Long = jpegUs.get()
+    fun readSendUs(): Long = sendUs.get()
     fun readStreamingActive(): Boolean = streamingActive.get()
     fun readLastError(): String = lastError.get() ?: ""
 
@@ -458,6 +485,9 @@ class AirCastCameraEngine {
             val focalLengths = c2.getCameraCharacteristic(
                 CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS
             )
+            val ranges = c2.getCameraCharacteristic(
+                CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES
+            ) ?: emptyArray()
             val minFocal = focalLengths?.minOrNull() ?: 0f
 
             val isFront = (facing == CameraCharacteristics.LENS_FACING_FRONT)
@@ -479,58 +509,75 @@ class AirCastCameraEngine {
                 }
                 .build()
 
-            lenses.add(LensEntry(camId, label, isFront, selector))
+            lenses.add(LensEntry(camId, label, isFront, selector, ranges))
         }
 
         if (lenses.isEmpty()) {
-            lenses.add(LensEntry("0", "Back Main", false, CameraSelector.DEFAULT_BACK_CAMERA))
+            lenses.add(LensEntry("0", "Back Main", false, CameraSelector.DEFAULT_BACK_CAMERA, emptyArray()))
         }
         activeLensIndex = activeLensIndex.coerceIn(0, lenses.lastIndex)
     }
 
+    private fun pickFpsRange(ranges: Array<Range<Int>>, fps: Int): Range<Int> {
+        val ok = ranges.filter { it.upper >= fps }
+        val bestUpper = ok.minOfOrNull { it.upper } ?: return Range(fps, fps)
+        return ok.filter { it.upper == bestUpper }.maxByOrNull { it.lower } ?: Range(fps, fps)
+    }
+
     @OptIn(ExperimentalCamera2Interop::class)
     private fun bindCameraUseCases() {
-        val act = activityRef as? LifecycleOwner ?: return
+        val act = activityRef ?: return
+        val lifecycleOwner = act as? LifecycleOwner ?: return
         val provider = cameraProvider ?: return
         val producer = surfaceProducer ?: return
         if (lenses.isEmpty()) return
 
         val entry = lenses[activeLensIndex.coerceIn(0, lenses.lastIndex)]
-        val resSelector = ResolutionSelector.Builder()
+        val fpsRange = pickFpsRange(entry.fpsRanges, targetFps)
+        val mainExec = ContextCompat.getMainExecutor(act)
+
+        // Cap local preview at 720p so ISP doesn't throttle when streaming 1080p
+        val previewSelector = ResolutionSelector.Builder()
+            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
             .setResolutionStrategy(
                 ResolutionStrategy(
-                    Size(targetWidth, targetHeight),
-                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                    Size(minOf(targetWidth, 1280), minOf(targetHeight, 720)),
+                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
                 )
             )
             .build()
 
-        // Preview bound directly to Flutter SurfaceProducer (zero-copy GPU)
         val previewBuilder = Preview.Builder()
-            .setResolutionSelector(resSelector)
+            .setResolutionSelector(previewSelector)
         Camera2Interop.Extender(previewBuilder)
-            .setCaptureRequestOption(
-                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                Range(targetFps, targetFps)
-            )
+            .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
         val preview = previewBuilder.build()
         preview.setSurfaceProvider { request ->
             val res = request.resolution
             producer.setSize(res.width, res.height)
+            request.setTransformationInfoListener(mainExec) { info ->
+                previewRotation.set(info.rotationDegrees)
+            }
             val surface: Surface = producer.surface
-            request.provideSurface(surface, ContextCompat.getMainExecutor(activityRef!!)) {}
+            request.provideSurface(surface, mainExec) {}
         }
 
-        // ImageAnalysis with STRATEGY_KEEP_ONLY_LATEST & locked FPS range
+        val analysisSelector = ResolutionSelector.Builder()
+            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
+            .setResolutionStrategy(
+                ResolutionStrategy(
+                    Size(targetWidth, targetHeight),
+                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
+                )
+            )
+            .build()
+
         val analysisBuilder = ImageAnalysis.Builder()
-            .setResolutionSelector(resSelector)
+            .setResolutionSelector(analysisSelector)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
         Camera2Interop.Extender(analysisBuilder)
-            .setCaptureRequestOption(
-                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                Range(targetFps, targetFps)
-            )
+            .setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
         val analysis = analysisBuilder.build()
         analysis.setAnalyzer(analysisExecutor) { image ->
             processImageProxy(image, entry.isFront)
@@ -538,8 +585,9 @@ class AirCastCameraEngine {
 
         try {
             provider.unbindAll()
-            val cam = provider.bindToLifecycle(act, entry.selector, preview, analysis)
+            val cam = provider.bindToLifecycle(lifecycleOwner, entry.selector, preview, analysis)
             activeCamera = cam
+            previewRotation.set(cam.cameraInfo.sensorRotationDegrees)
             if (torchEnabled.get() && cam.cameraInfo.hasFlashUnit()) {
                 cam.cameraControl.enableTorch(true)
             } else {
@@ -554,126 +602,149 @@ class AirCastCameraEngine {
         try {
             if (!streamingActive.get()) return
 
-            val width = image.width
-            val height = image.height
+            val w = image.width
+            val h = image.height
             val rotation = image.imageInfo.rotationDegrees
             val timestampMs = SystemClock.elapsedRealtime()
 
-            val nv21 = yuv420888ToNv21(image)
-            jpegStream.reset()
-            val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
+            val t0 = System.nanoTime()
+            val needed = w * h * 3 / 2
+            if (nv21Bufs[nv21Idx].size < needed) {
+                nv21Bufs[nv21Idx] = ByteArray(needed)
+            }
+            val nv21 = nv21Bufs[nv21Idx]
+            fillNv21(image, nv21)
+            updateEma(convUs, (System.nanoTime() - t0) / 1000L)
+
+            // If encoder thread is still compressing the previous frame, drop this one immediately
+            if (!encBusy.compareAndSet(false, true)) {
+                droppedCount.incrementAndGet()
+                return
+            }
+            // Hand nv21Bufs[nv21Idx] exclusively to encodeExecutor; next frame writes to the other slot
+            nv21Idx = nv21Idx xor 1
+
             val q = effectiveJpegQuality.get().coerceIn(40, 95)
-            yuvImage.compressToJpeg(Rect(0, 0, width, height), q, jpegStream)
-
-            val jpegBytes = jpegStream.toByteArray()
-            if (jpegBytes.isEmpty() || jpegBytes.size > MAX_FRAME_BYTES) return
-
-            capturedCount.incrementAndGet()
-
             var flags = 0
             if (isFront) flags = flags or FLAG_FRONT_CAMERA
             if (mirrorHorizontal.get()) flags = flags or FLAG_MIRROR_HORIZONTAL
+            val seq = seqCounter.incrementAndGet()
 
-            val frame = EncodedFrame(
-                sequence = seqCounter.incrementAndGet(),
-                timestampMs = timestampMs,
-                width = width,
-                height = height,
-                rotation = rotation,
-                flags = flags,
-                jpegBytes = jpegBytes
-            )
+            encodeExecutor.execute {
+                try {
+                    val t1 = System.nanoTime()
+                    jpegStream.reset()
+                    YuvImage(nv21, ImageFormat.NV21, w, h, null)
+                        .compressToJpeg(Rect(0, 0, w, h), q, jpegStream)
+                    val jpegBytes = jpegStream.toByteArray()
+                    updateEma(jpegUs, (System.nanoTime() - t1) / 1000L)
 
-            // 1-slot latest-frame-wins queue: overwrite stale unsent frame immediately
-            val prev = latestPendingFrame.getAndSet(frame)
-            if (prev != null) {
-                droppedCount.incrementAndGet()
-            }
-            synchronized(senderSignal) {
-                senderSignal.notify()
+                    if (jpegBytes.isEmpty() || jpegBytes.size > MAX_FRAME_BYTES) return@execute
+
+                    capturedCount.incrementAndGet()
+                    val prev = latestPendingFrame.getAndSet(
+                        EncodedFrame(seq, timestampMs, w, h, rotation, flags, jpegBytes)
+                    )
+                    if (prev != null) {
+                        droppedCount.incrementAndGet()
+                    }
+                    synchronized(senderSignal) {
+                        senderSignal.notify()
+                    }
+                } catch (e: Exception) {
+                    lastError.set("Encode error: ${e.message}")
+                } finally {
+                    encBusy.set(false)
+                }
             }
         } catch (e: Exception) {
-            lastError.set("Encode error: ${e.message}")
+            lastError.set("Capture error: ${e.message}")
         } finally {
             image.close()
         }
     }
 
     /**
-     * Stride-safe YUV_420_888 -> NV21 conversion (handles arbitrary rowStride & pixelStride).
+     * Bulk-row YUV_420_888 -> NV21 conversion with verified semi-planar NV21 fast path.
      */
-    private fun yuv420888ToNv21(image: ImageProxy): ByteArray {
-        val width = image.width
-        val height = image.height
-        val ySize = width * height
-        val uvSize = ySize / 2
-        val required = ySize + uvSize
-        if (nv21Scratch.size < required) {
-            nv21Scratch = ByteArray(required)
-        }
-        val out = nv21Scratch
+    private fun fillNv21(image: ImageProxy, out: ByteArray) {
+        val w = image.width
+        val h = image.height
+        val ySize = w * h
 
-        // Copy Y plane row by row
-        val yPlane = image.planes[0]
-        val yBuf = yPlane.buffer
-        val yRowStride = yPlane.rowStride
-        val yPixelStride = yPlane.pixelStride
-        var dstPos = 0
-        if (yPixelStride == 1 && yRowStride == width) {
-            yBuf.position(0)
-            yBuf.get(out, 0, ySize)
-            dstPos = ySize
+        val yp = image.planes[0]
+        val yb = yp.buffer
+        if (yp.pixelStride == 1 && yp.rowStride == w) {
+            yb.position(0)
+            yb.get(out, 0, ySize)
         } else {
-            for (row in 0 until height) {
-                val rowStart = row * yRowStride
-                if (yPixelStride == 1) {
-                    yBuf.position(rowStart)
-                    yBuf.get(out, dstPos, width)
-                    dstPos += width
-                } else {
-                    for (col in 0 until width) {
-                        out[dstPos++] = yBuf.get(rowStart + col * yPixelStride)
-                    }
+            for (r in 0 until h) {
+                yb.position(r * yp.rowStride)
+                yb.get(out, r * w, w)
+            }
+        }
+
+        val up = image.planes[1]
+        val vp = image.planes[2]
+        val ub = up.buffer
+        val vb = vp.buffer
+        var dst = ySize
+        val halfH = h / 2
+
+        if (vp.pixelStride == 2 && up.pixelStride == 2 && looksLikeNv21(ub, vb)) {
+            for (r in 0 until halfH) {
+                val start = r * vp.rowStride
+                val len = minOf(w, vb.limit() - start)
+                vb.position(start)
+                vb.get(out, dst, len)
+                if (len < w) {
+                    out[dst + w - 1] = ub.get(ub.limit() - 1)
+                }
+                dst += w
+            }
+        } else {
+            val halfW = w / 2
+            if (uRow.size < up.rowStride) uRow = ByteArray(up.rowStride)
+            if (vRow.size < vp.rowStride) vRow = ByteArray(vp.rowStride)
+            for (r in 0 until halfH) {
+                val us = r * up.rowStride
+                val vs = r * vp.rowStride
+                ub.position(us)
+                ub.get(uRow, 0, minOf(up.rowStride, ub.limit() - us))
+                vb.position(vs)
+                vb.get(vRow, 0, minOf(vp.rowStride, vb.limit() - vs))
+                for (c in 0 until halfW) {
+                    out[dst++] = vRow[c * vp.pixelStride]
+                    out[dst++] = uRow[c * up.pixelStride]
                 }
             }
         }
-
-        // Interleave V then U (NV21) respecting both rowStride & pixelStride
-        val uPlane = image.planes[1]
-        val vPlane = image.planes[2]
-        val uBuf = uPlane.buffer
-        val vBuf = vPlane.buffer
-        val uvRowStride = uPlane.rowStride
-        val uvPixelStride = uPlane.pixelStride
-        val vRowStride = vPlane.rowStride
-        val vPixelStride = vPlane.pixelStride
-        val halfH = height / 2
-        val halfW = width / 2
-
-        for (row in 0 until halfH) {
-            val uRowStart = row * uvRowStride
-            val vRowStart = row * vRowStride
-            for (col in 0 until halfW) {
-                out[dstPos++] = vBuf.get(vRowStart + col * vPixelStride)
-                out[dstPos++] = uBuf.get(uRowStart + col * uvPixelStride)
-            }
-        }
-        return out
     }
 
-    private fun senderLoop() {
+    private fun looksLikeNv21(ub: ByteBuffer, vb: ByteBuffer): Boolean {
+        val n = minOf(ub.limit(), vb.limit() - 1)
+        if (n < 64) return false
+        for (i in 0 until 16) {
+            val k = ((n / 16) * i) and 1.inv()
+            if (ub.get(k) != vb.get(k + 1)) return false
+        }
+        return true
+    }
+
+    private fun senderLoop(gen: Int) {
         val headerBuf = ByteBuffer.allocate(HEADER_SIZE).order(ByteOrder.BIG_ENDIAN)
 
-        while (senderRunning.get()) {
+        while (senderRunning.get() && senderGen.get() == gen) {
             var socket: Socket? = null
             try {
                 socket = Socket()
                 socket.tcpNoDelay = true
-                socket.sendBufferSize = 256 * 1024
+                socket.sendBufferSize = 96 * 1024
+                socket.trafficClass = 0x28
                 socket.connect(InetSocketAddress(currentHost, currentPort), 4000)
                 videoSocket = socket
 
-                val out = BufferedOutputStream(socket.getOutputStream(), 128 * 1024)
+                val out = BufferedOutputStream(socket.getOutputStream(), 96 * 1024)
 
                 // Step 1: Authenticate Port 4821 with active sessionToken
                 val tokenBytes = currentSessionToken.toByteArray(Charsets.UTF_8)
@@ -689,12 +760,12 @@ class AirCastCameraEngine {
                 lastError.set("")
 
                 // Step 2: Pump latest JPEG frames with adaptive quality backoff
-                while (senderRunning.get()) {
+                while (senderRunning.get() && senderGen.get() == gen) {
                     var frame = latestPendingFrame.getAndSet(null)
                     if (frame == null) {
                         synchronized(senderSignal) {
                             frame = latestPendingFrame.getAndSet(null)
-                            if (frame == null && senderRunning.get()) {
+                            if (frame == null && senderRunning.get() && senderGen.get() == gen) {
                                 senderSignal.wait(100)
                                 frame = latestPendingFrame.getAndSet(null)
                             }
@@ -702,7 +773,7 @@ class AirCastCameraEngine {
                     }
                     val f = frame ?: continue
 
-                    val t0 = SystemClock.elapsedRealtime()
+                    val t0 = System.nanoTime()
                     writePacket(
                         out, headerBuf,
                         type = TYPE_JPEG_FRAME,
@@ -715,21 +786,22 @@ class AirCastCameraEngine {
                         payload = f.jpegBytes
                     )
                     out.flush()
-                    val writeMs = SystemClock.elapsedRealtime() - t0
+                    val writeUs = (System.nanoTime() - t0) / 1000L
+                    updateEma(sendUs, writeUs)
 
                     sentCount.incrementAndGet()
                     totalBytesSent.addAndGet((HEADER_SIZE + f.jpegBytes.size).toLong())
 
-                    // Adaptive Wi-Fi quality backoff so video never starves Port 4820 audio
+                    val writeMs = writeUs / 1000L
                     val curQ = effectiveJpegQuality.get()
-                    if (writeMs > 40 && curQ > 45) {
+                    if (writeMs > 35 && curQ > 45) {
                         effectiveJpegQuality.set((curQ - 5).coerceAtLeast(45))
-                    } else if (writeMs < 15 && curQ < baseJpegQuality) {
+                    } else if (writeMs < 12 && curQ < baseJpegQuality) {
                         effectiveJpegQuality.set((curQ + 2).coerceAtMost(baseJpegQuality))
                     }
                 }
             } catch (e: Exception) {
-                if (senderRunning.get()) {
+                if (senderRunning.get() && senderGen.get() == gen) {
                     lastError.set("Video socket error: ${e.message}")
                     try {
                         Thread.sleep(1000)

@@ -46,6 +46,8 @@ class CameraScreen extends StatelessWidget {
       final connected = client.isConnected.value;
       final streaming = cam.isStreaming.value;
       final texId = cam.textureId.value;
+      final rot = cam.previewRotation.value;
+      final isPortraitSensor = rot == 90 || rot == 270;
 
       return Scaffold(
         backgroundColor: const Color(0xFF0E0E10),
@@ -63,79 +65,102 @@ class CameraScreen extends StatelessWidget {
         body: ListView(
           padding: const EdgeInsets.all(16),
           children: [
-            // Zero-Copy Native GPU Viewfinder (Tap-to-Focus enabled)
-            AspectRatio(
-              aspectRatio: 16 / 9,
-              child: LayoutBuilder(
-                builder: (ctx, constraints) {
-                  return GestureDetector(
-                    onTapDown: (details) {
-                      final nx = (details.localPosition.dx / constraints.maxWidth).clamp(0.0, 1.0);
-                      final ny = (details.localPosition.dy / constraints.maxHeight).clamp(0.0, 1.0);
-                      cam.tapToFocus(nx, ny);
-                    },
-                    child: Container(
-                      decoration: BoxDecoration(
-                        color: Colors.black,
-                        borderRadius: BorderRadius.circular(16),
-                        border: Border.all(
-                          color: streaming
-                              ? Colors.greenAccent.withValues(alpha: 0.6)
-                              : Colors.white12,
-                        ),
-                      ),
-                      clipBehavior: Clip.antiAlias,
-                      child: Stack(
-                        fit: StackFit.expand,
-                        children: [
-                          if (texId >= 0)
-                            Texture(textureId: texId)
-                          else
-                            Center(
-                              child: Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Text(
-                                    cam.statusText.value,
-                                    textAlign: TextAlign.center,
-                                    style: const TextStyle(color: Colors.white60, fontSize: 13),
-                                  ),
-                                  const SizedBox(height: 10),
-                                  FilledButton.tonal(
-                                    onPressed: cam.initPreview,
-                                    child: const Text('Retry Preview'),
-                                  ),
-                                ],
-                              ),
-                            ),
-
-                          // Live Telemetry Overlay Badge
-                          Positioned(
-                            top: 10,
-                            left: 10,
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                              decoration: BoxDecoration(
-                                color: Colors.black.withValues(alpha: 0.65),
-                                borderRadius: BorderRadius.circular(8),
-                              ),
-                              child: Text(
-                                streaming
-                                    ? 'LIVE • ${cam.sentFps.value} FPS • ${cam.mbps.value.toStringAsFixed(1)} Mbps • Q${cam.effectiveQuality.value}'
-                                    : 'PREVIEW • ${cam.preset.value.label}',
-                                style: TextStyle(
-                                  fontFamily: 'monospace',
-                                  fontSize: 11,
-                                  color: streaming ? Colors.greenAccent : Colors.white70,
-                                ),
-                              ),
+            // Zero-Copy Native GPU Viewfinder (Rotated upright + Tap-to-Focus)
+            Center(
+              child: ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxHeight: isPortraitSensor ? 360 : 240,
+                ),
+                child: AspectRatio(
+                  aspectRatio: isPortraitSensor ? 9 / 16 : 16 / 9,
+                  child: LayoutBuilder(
+                    builder: (ctx, constraints) {
+                      return GestureDetector(
+                        onTapDown: (details) {
+                          final nx = (details.localPosition.dx / constraints.maxWidth).clamp(0.0, 1.0);
+                          final ny = (details.localPosition.dy / constraints.maxHeight).clamp(0.0, 1.0);
+                          cam.tapToFocus(nx, ny);
+                        },
+                        child: Container(
+                          decoration: BoxDecoration(
+                            color: Colors.black,
+                            borderRadius: BorderRadius.circular(16),
+                            border: Border.all(
+                              color: streaming
+                                  ? Colors.greenAccent.withValues(alpha: 0.6)
+                                  : Colors.white12,
                             ),
                           ),
-                        ],
-                      ),
-                    ),
-                  );
-                },
+                          clipBehavior: Clip.antiAlias,
+                          child: Stack(
+                            fit: StackFit.expand,
+                            children: [
+                              if (texId >= 0)
+                                Transform(
+                                  alignment: Alignment.center,
+                                  transform: Matrix4.diagonal3Values(
+                                    cam.mirrorHorizontal.value ? -1.0 : 1.0,
+                                    1.0,
+                                    1.0,
+                                  ),
+                                  child: RotatedBox(
+                                    quarterTurns: rot ~/ 90,
+                                    child: Texture(textureId: texId),
+                                  ),
+                                )
+                              else
+                                Center(
+                                  child: Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Text(
+                                        cam.statusText.value,
+                                        textAlign: TextAlign.center,
+                                        style: const TextStyle(color: Colors.white60, fontSize: 13),
+                                      ),
+                                      const SizedBox(height: 10),
+                                      FilledButton.tonal(
+                                        onPressed: cam.initPreview,
+                                        child: const Text('Retry Preview'),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+
+                              // Live Telemetry + Stage Timing Overlay Badge
+                              Positioned(
+                                top: 10,
+                                left: 10,
+                                right: 10,
+                                child: Align(
+                                  alignment: Alignment.topLeft,
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                                    decoration: BoxDecoration(
+                                      color: Colors.black.withValues(alpha: 0.68),
+                                      borderRadius: BorderRadius.circular(8),
+                                    ),
+                                    child: Text(
+                                      streaming
+                                          ? 'LIVE • ${cam.sentFps.value} FPS • ${cam.mbps.value.toStringAsFixed(1)} Mbps • Q${cam.effectiveQuality.value}\n'
+                                          'conv ${cam.convMs.value.toStringAsFixed(1)}ms • jpeg ${cam.jpegMs.value.toStringAsFixed(1)}ms • send ${cam.sendMs.value.toStringAsFixed(1)}ms'
+                                          : 'PREVIEW • ${cam.preset.value.label}',
+                                      style: TextStyle(
+                                        fontFamily: 'monospace',
+                                        fontSize: 11,
+                                        color: streaming ? Colors.greenAccent : Colors.white70,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
               ),
             ),
 
@@ -252,9 +277,15 @@ class CameraScreen extends StatelessWidget {
                   ),
                   const Divider(color: Colors.white12),
                   Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      const Text('JPEG Quality (Auto-Backoff)', style: TextStyle(fontWeight: FontWeight.w600)),
+                      const Expanded(
+                        child: Text(
+                          'JPEG Quality (Auto-Backoff)',
+                          style: TextStyle(fontWeight: FontWeight.w600),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
                       Text(
                         'Target ${cam.jpegQuality.value}% (Live ${cam.effectiveQuality.value}%)',
                         style: const TextStyle(fontFamily: 'monospace', fontSize: 12, color: Colors.greenAccent),

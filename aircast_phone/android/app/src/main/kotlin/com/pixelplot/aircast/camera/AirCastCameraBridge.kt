@@ -55,6 +55,18 @@ object AirCastCameraBridge {
     fun readLensCount(): Int = engine().readLensCount()
 
     @Keep @JvmStatic
+    fun readPreviewRotation(): Int = engine().readPreviewRotation()
+
+    @Keep @JvmStatic
+    fun readConvUs(): Long = engine().readConvUs()
+
+    @Keep @JvmStatic
+    fun readJpegUs(): Long = engine().readJpegUs()
+
+    @Keep @JvmStatic
+    fun readSendUs(): Long = engine().readSendUs()
+
+    @Keep @JvmStatic
     fun readLensLabel(index: Int): String = engine().readLensLabel(index)
 
     @Keep @JvmStatic

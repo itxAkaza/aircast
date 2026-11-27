@@ -10,6 +10,7 @@ class CameraStreamController extends GetxController {
   final ClientController client = Get.find<ClientController>();
 
   final RxInt textureId = (-1).obs;
+  final RxInt previewRotation = 90.obs;
   final RxBool isCameraReady = false.obs;
   final RxBool isStreaming = false.obs;
   final RxBool isBlackoutMode = false.obs;
@@ -27,11 +28,14 @@ class CameraStreamController extends GetxController {
   final RxList<String> lensLabels = <String>[].obs;
   final RxInt activeLensIndex = 0.obs;
 
-  // Live Telemetry
+  // Live Telemetry & Stage Timings
   final RxInt captureFps = 0.obs;
   final RxInt sentFps = 0.obs;
   final RxInt droppedFrames = 0.obs;
   final RxDouble mbps = 0.0.obs;
+  final RxDouble convMs = 0.0.obs;
+  final RxDouble jpegMs = 0.0.obs;
+  final RxDouble sendMs = 0.0.obs;
   final RxString statusText = 'Starting native CameraX preview...'.obs;
 
   Timer? _statsTimer;
@@ -67,6 +71,10 @@ class CameraStreamController extends GetxController {
       mbps.value = bytes >= _lastBytes ? ((bytes - _lastBytes) * 8.0) / 1000000.0 : 0.0;
       droppedFrames.value = AirCastCameraBridge.readDroppedTotal();
       effectiveQuality.value = AirCastCameraBridge.readEffectiveQuality();
+      previewRotation.value = AirCastCameraBridge.readPreviewRotation();
+      convMs.value = AirCastCameraBridge.readConvUs() / 1000.0;
+      jpegMs.value = AirCastCameraBridge.readJpegUs() / 1000.0;
+      sendMs.value = AirCastCameraBridge.readSendUs() / 1000.0;
 
       _lastCaptured = cap;
       _lastSent = sent;
@@ -133,6 +141,7 @@ class CameraStreamController extends GetxController {
       lensLabels.assignAll(labels);
       activeLensIndex.value = AirCastCameraBridge.readActiveLensIndex();
     }
+    previewRotation.value = AirCastCameraBridge.readPreviewRotation();
     hasTorch.value = AirCastCameraBridge.hasTorch();
     minZoom.value = AirCastCameraBridge.readMinZoom();
     maxZoom.value = AirCastCameraBridge.readMaxZoom().clamp(1.0, 8.0);
@@ -159,6 +168,9 @@ class CameraStreamController extends GetxController {
         _lastCaptured = 0;
         _lastSent = 0;
         _lastBytes = 0;
+        convMs.value = 0.0;
+        jpegMs.value = 0.0;
+        sendMs.value = 0.0;
         statusText.value = 'Streaming ${preset.value.label} to ${client.serverName.value}';
         client.log('Camera streaming started on port ${client.videoPort.value}');
       } else {
@@ -177,6 +189,9 @@ class CameraStreamController extends GetxController {
     captureFps.value = 0;
     sentFps.value = 0;
     mbps.value = 0.0;
+    convMs.value = 0.0;
+    jpegMs.value = 0.0;
+    sendMs.value = 0.0;
     statusText.value = reason;
   }
 
