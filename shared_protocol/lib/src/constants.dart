@@ -1,6 +1,9 @@
 class AirCastConstants {
   static const int protocolVersion = 1;
-  static const int defaultPort = 54321;
+  static const int defaultPort = 4820;
+  static const int defaultVideoPort = 4821;
+  static const int videoProtocolVersion = 1;
+  static const int maxVideoFrameBytes = 4 * 1024 * 1024; // 4 MB hard cap
 }
 
 class PacketType {

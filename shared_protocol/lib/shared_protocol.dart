@@ -5,3 +5,5 @@ export 'src/constants.dart';
 export 'src/packet_framer.dart';
 export 'src/pairing_payload.dart';
 export 'src/pcm_utils.dart';
+export 'src/video_config.dart';
+export 'src/video_frame_codec.dart';
