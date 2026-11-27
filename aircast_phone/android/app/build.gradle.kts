@@ -44,6 +44,15 @@ kotlin {
     }
 }
 
+
 flutter {
     source = "../.."
+}
+
+dependencies {
+    val cameraxVersion = "1.6.2"
+    implementation("androidx.camera:camera-core:$cameraxVersion")
+    implementation("androidx.camera:camera-camera2:$cameraxVersion")
+    implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
+    implementation("androidx.annotation:annotation:1.9.1")
 }

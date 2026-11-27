@@ -35,6 +35,8 @@ dependencies:
   mobile_scanner: ^7.5.0
   record: ^7.2.0
   flutter_foreground_task: ^11.0.3
+  jni: ^1.1.2
+  jni_flutter: ^1.0.4
 
   shared_protocol:
     path: ../shared_protocol
@@ -46,6 +48,7 @@ dependencies:
 dev_dependencies:
   flutter_test:
     sdk: flutter
+  jnigen: ^1.0.1
 
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is

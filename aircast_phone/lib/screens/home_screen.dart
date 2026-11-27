@@ -4,6 +4,7 @@ import 'package:get/get.dart';
 import 'package:shared_protocol/shared_protocol.dart';
 
 import '../controller/client_controller.dart';
+import 'camera_screen.dart';
 import 'mic_test_screen.dart';
 import 'qr_scanner_screen.dart';
 
@@ -238,10 +239,11 @@ class _HomeScreenState extends State<HomeScreen> {
                         ),
                       ),
                       const SizedBox(width: 8),
-                      const Expanded(
-                        child: OutlinedButton(
-                          onPressed: null,
-                          child: Text('Cam (Ph 3)'),
+                      Expanded(
+                        child: FilledButton.tonalIcon(
+                          onPressed: () => Get.to(() => const CameraScreen()),
+                          icon: const Icon(Icons.videocam),
+                          label: const Text('Cam Only'),
                         ),
                       ),
                       const SizedBox(width: 8),

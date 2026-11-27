@@ -19,6 +19,8 @@ class ClientController extends GetxController {
   final RxString serverName = ''.obs;
   final RxnInt lastPingMs = RxnInt();
   final RxList<String> logs = <String>[].obs;
+  final RxString sessionToken = ''.obs;
+  final RxInt videoPort = AirCastConstants.defaultVideoPort.obs;
 
   /// Persisted last-known PC credentials so you don't need to re-scan QR.
   final RxString lastHost = ''.obs;
@@ -192,6 +194,9 @@ class ClientController extends GetxController {
         reconnectAttempt.value = 0;
         _reconnectTimer?.cancel();
         serverName.value = (msg['server'] as String?) ?? 'Windows PC';
+        sessionToken.value = (msg['sessionToken'] as String?) ?? '';
+        videoPort.value = (msg['videoPort'] as num?)?.toInt() ??
+            AirCastConstants.defaultVideoPort;
         _lastServerActivity = DateTime.now();
         _startHeartbeat();
 
@@ -238,6 +243,7 @@ class ClientController extends GetxController {
     _decoder.reset();
     isConnected.value = false;
     lastPingMs.value = null;
+    sessionToken.value = '';
 
     if (_manualDisconnect || !hasSavedServer) {
       isReconnecting.value = false;
@@ -299,6 +305,7 @@ class ClientController extends GetxController {
   void _resetDisconnectedState() {
     _decoder.reset();
     isConnected.value = false;
+    sessionToken.value = '';
     isReconnecting.value = false;
     reconnectAttempt.value = 0;
     serverName.value = '';
