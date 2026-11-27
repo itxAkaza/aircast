@@ -1,5 +1,6 @@
 import 'package:aircast_desktop/controller/server_controller.dart';
 import 'package:aircast_desktop/screens/mic_monitor_screen.dart';
+import 'package:aircast_desktop/screens/vcam_test_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:qr_flutter/qr_flutter.dart';
@@ -24,6 +25,11 @@ class ServerScreen extends StatelessWidget {
               icon: const Icon(Icons.graphic_eq, size: 18),
               label: const Text('Mic Monitor'),
             ),
+          ),
+          FilledButton.tonalIcon(
+            onPressed: () => Get.to(() => const VcamTestScreen()),
+            icon: const Icon(Icons.videocam),
+            label: const Text('Virtual Cam (3A)'),
           ),
           IconButton(
             tooltip: 'Refresh Network IPs',
