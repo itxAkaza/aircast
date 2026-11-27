@@ -9,22 +9,61 @@ class MicTestScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final client = Get.find<ClientController>();
-    final mic = Get.put(MicController());
+    final mic = Get.isRegistered<MicController>()
+        ? Get.find<MicController>()
+        : Get.put(MicController(), permanent: true);
 
     return Scaffold(
       backgroundColor: const Color(0xFF0E0E10),
       appBar: AppBar(
         backgroundColor: const Color(0xFF16161A),
-        title: const Text('Mic Stream Test (Phase 2A)'),
+        title: const Text('AirCast Mic — Phase 2C'),
       ),
       body: Obx(() {
         final connected = client.isConnected.value;
+        final reconnecting = client.isReconnecting.value;
         final streaming = mic.isStreaming.value;
         final muted = mic.isMuted.value;
 
         return ListView(
           padding: const EdgeInsets.all(20),
           children: [
+            // Battery Optimization Banner (prevents Android from killing Wi-Fi on lock)
+            if (!mic.isBatteryUnrestricted.value) ...[
+              Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF231A12),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(
+                    color: Colors.amberAccent.withValues(alpha: 0.5),
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.battery_alert, color: Colors.amberAccent),
+                    const SizedBox(width: 12),
+                    const Expanded(
+                      child: Text(
+                        'Allow unrestricted battery so Android does not pause Wi-Fi when the screen locks.',
+                        style: TextStyle(fontSize: 12, color: Colors.white70),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: Colors.amberAccent,
+                        foregroundColor: Colors.black,
+                      ),
+                      onPressed: mic.requestUnrestrictedBattery,
+                      child: const Text('Allow'),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+            ],
+
             // Connection & Stream Header
             Container(
               padding: const EdgeInsets.all(16),
@@ -32,7 +71,11 @@ class MicTestScreen extends StatelessWidget {
                 color: const Color(0xFF16161A),
                 borderRadius: BorderRadius.circular(14),
                 border: Border.all(
-                  color: streaming ? Colors.greenAccent.withValues(alpha: 0.5) : Colors.white12,
+                  color: reconnecting
+                      ? Colors.amberAccent.withValues(alpha: 0.7)
+                      : (streaming
+                      ? Colors.greenAccent.withValues(alpha: 0.5)
+                      : Colors.white12),
                 ),
               ),
               child: Column(
@@ -41,9 +84,18 @@ class MicTestScreen extends StatelessWidget {
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      Text(
-                        connected ? 'PC: ${client.serverName.value}' : 'PC Disconnected',
-                        style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                      Expanded(
+                        child: Text(
+                          connected
+                              ? 'PC: ${client.serverName.value}'
+                              : (reconnecting
+                              ? 'Reconnecting (#${client.reconnectAttempt.value})...'
+                              : 'PC Disconnected'),
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
                       ),
                       Text(
                         '${mic.packetsSentPerSec.value} pkt/s',
@@ -58,12 +110,13 @@ class MicTestScreen extends StatelessWidget {
                   Text(
                     mic.statusText.value,
                     style: TextStyle(
-                      color: streaming ? Colors.greenAccent : Colors.white60,
+                      color: reconnecting
+                          ? Colors.amberAccent
+                          : (streaming ? Colors.greenAccent : Colors.white60),
                       fontSize: 13,
                     ),
                   ),
                   const SizedBox(height: 16),
-                  // Live Local Input Meter
                   Row(
                     children: [
                       Expanded(
@@ -94,7 +147,9 @@ class MicTestScreen extends StatelessWidget {
                           style: TextStyle(
                             fontFamily: 'monospace',
                             fontWeight: FontWeight.bold,
-                            color: mic.isClipping.value ? Colors.redAccent : Colors.white70,
+                            color: mic.isClipping.value
+                                ? Colors.redAccent
+                                : Colors.white70,
                           ),
                         ),
                       ),
@@ -114,11 +169,14 @@ class MicTestScreen extends StatelessWidget {
                   child: FilledButton.icon(
                     style: FilledButton.styleFrom(
                       padding: const EdgeInsets.symmetric(vertical: 16),
-                      backgroundColor: streaming ? Colors.redAccent : Colors.green,
+                      backgroundColor:
+                      streaming ? Colors.redAccent : Colors.green,
                     ),
-                    onPressed: (!connected || mic.isBusy.value)
+                    onPressed: ((!connected && !streaming) || mic.isBusy.value)
                         ? null
-                        : () => streaming ? mic.stopStreaming() : mic.startStreaming(),
+                        : () => streaming
+                        ? mic.stopStreaming()
+                        : mic.startStreaming(),
                     icon: Icon(streaming ? Icons.stop : Icons.mic),
                     label: Text(streaming ? 'Stop Mic' : 'Start Mic'),
                   ),
@@ -128,7 +186,9 @@ class MicTestScreen extends StatelessWidget {
                   child: FilledButton.tonalIcon(
                     style: FilledButton.styleFrom(
                       padding: const EdgeInsets.symmetric(vertical: 16),
-                      backgroundColor: muted ? Colors.amber.withValues(alpha: 0.25) : null,
+                      backgroundColor: muted
+                          ? Colors.amber.withValues(alpha: 0.25)
+                          : null,
                     ),
                     onPressed: mic.toggleMute,
                     icon: Icon(
@@ -180,7 +240,7 @@ class MicTestScreen extends StatelessWidget {
                     onChangeEnd: (_) => mic.commitGain(),
                   ),
                   const Text(
-                    'Values above 1.0x boost voice and room noise; clamping protects against harsh wrap-around.',
+                    'Keep around 1.0x for natural voice; higher values amplify room noise.',
                     style: TextStyle(fontSize: 12, color: Colors.white54),
                   ),
                 ],
@@ -189,8 +249,7 @@ class MicTestScreen extends StatelessWidget {
 
             const SizedBox(height: 16),
 
-            // Hardware Audio Filters Card
-            // Hardware Audio Filters Card
+            // Hardware Audio Filters Card (Material wrapper prevents ListTile spam)
             Material(
               color: const Color(0xFF16161A),
               shape: RoundedRectangleBorder(
@@ -203,21 +262,23 @@ class MicTestScreen extends StatelessWidget {
                   SwitchListTile(
                     title: const Text('Noise Cancellation'),
                     subtitle: const Text(
-                      'Best-effort Android hardware NoiseSuppressor (restarts stream)',
+                      'Optional Android DSP filter (off = natural voice, restarts stream)',
                       style: TextStyle(fontSize: 12, color: Colors.white54),
                     ),
                     value: mic.noiseSuppression.value,
-                    onChanged: mic.isBusy.value ? null : mic.toggleNoiseSuppression,
+                    onChanged:
+                    mic.isBusy.value ? null : mic.toggleNoiseSuppression,
                   ),
                   const Divider(height: 1, color: Colors.white12),
                   SwitchListTile(
                     title: const Text('Echo Cancellation'),
                     subtitle: const Text(
-                      'Helps reduce speaker bleed when testing near PC',
+                      'Only enable if testing without headphones',
                       style: TextStyle(fontSize: 12, color: Colors.white54),
                     ),
                     value: mic.echoCancellation.value,
-                    onChanged: mic.isBusy.value ? null : mic.toggleEchoCancellation,
+                    onChanged:
+                    mic.isBusy.value ? null : mic.toggleEchoCancellation,
                   ),
                 ],
               ),
