@@ -117,3 +117,37 @@ add_dependencies(${BINARY_NAME} aircast_audio)
 
 install(TARGETS aircast_audio RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}"
         COMPONENT Runtime)
+
+# === AirCast Phase 3 Virtual Camera DirectShow Filter (aircast_vcam.dll) ===
+add_library(aircast_vcam SHARED
+        "vcam/aircast_vcam.cpp"
+        "vcam/aircast_vcam.def"
+)
+target_compile_features(aircast_vcam PRIVATE cxx_std_17)
+target_link_libraries(aircast_vcam PRIVATE
+        strmiids
+        ole32
+        oleaut32
+        advapi32
+        uuid
+        winmm
+)
+add_dependencies(${BINARY_NAME} aircast_vcam)
+install(TARGETS aircast_vcam RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}"
+        COMPONENT Runtime)
+
+# === AirCast Phase 3 Native Video Engine & SHM Bridge (aircast_video.dll) ===
+add_library(aircast_video SHARED
+        "vcam/aircast_video.cpp"
+)
+target_compile_features(aircast_video PRIVATE cxx_std_17)
+target_link_libraries(aircast_video PRIVATE
+        advapi32
+        shell32
+        winmm
+        ole32
+        windowscodecs
+)
+add_dependencies(${BINARY_NAME} aircast_video)
+install(TARGETS aircast_video RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}"
+        COMPONENT Runtime)

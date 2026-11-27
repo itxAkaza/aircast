@@ -34,6 +34,16 @@ class ServerController extends GetxController {
     token: pairingToken.value,
   ).toJsonString();
 
+  final RxString activeSessionToken = ''.obs;
+  int _failedPinAttempts = 0;
+  DateTime? _pinLockedUntil;
+
+  String _generateSessionToken() {
+    final rng = Random.secure();
+    final bytes = List<int>.generate(16, (_) => rng.nextInt(256));
+    return bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+  }
+
   @override
   void onInit() {
     super.onInit();
@@ -132,8 +142,29 @@ class ServerController extends GetxController {
       final token = msg['token'] as String? ?? '';
       final device = msg['device'] as String? ?? 'Android Device';
 
+      final now = DateTime.now();
+      if (_pinLockedUntil != null && now.isBefore(_pinLockedUntil!)) {
+        final secs = _pinLockedUntil!.difference(now).inSeconds + 1;
+        log('Blocked handshake during cooldown (${secs}s remaining)');
+        socket.add(PacketFramer.encodeControl({
+          'cmd': 'handshake_ack',
+          'ok': false,
+          'error': 'Too many failed PIN attempts. Wait ${secs}s.',
+        }));
+        socket.flush();
+        socket.close();
+        return;
+      }
+
       if (token != pairingToken.value) {
-        log('Rejected $device: invalid PIN');
+        _failedPinAttempts++;
+        if (_failedPinAttempts >= 5) {
+          _pinLockedUntil = now.add(const Duration(seconds: 15));
+          _failedPinAttempts = 0;
+          log('5 invalid PIN attempts — locked pairing for 15s');
+        } else {
+          log('Rejected $device: invalid PIN ($_failedPinAttempts/5)');
+        }
         socket.add(PacketFramer.encodeControl({
           'cmd': 'handshake_ack',
           'ok': false,
@@ -144,16 +175,23 @@ class ServerController extends GetxController {
         return;
       }
 
+      _failedPinAttempts = 0;
+      _pinLockedUntil = null;
+      activeSessionToken.value = _generateSessionToken();
       isClientConnected.value = true;
       connectedDevice.value = device;
-      log('Paired with $device');
+      log('Paired with $device (session token issued)');
 
       socket.add(PacketFramer.encodeControl({
         'cmd': 'handshake_ack',
         'ok': true,
         'server': Platform.localHostname,
+        'sessionToken': activeSessionToken.value,
+        'videoPort': AirCastConstants.defaultVideoPort,
       }));
-    } else if (cmd == 'ping') {
+    }
+
+    else if (cmd == 'ping') {
       final ts = msg['ts'];
       log('Ping received -> sending Pong');
       socket.add(PacketFramer.encodeControl({'cmd': 'pong', 'ts': ts}));
@@ -186,6 +224,7 @@ class ServerController extends GetxController {
     _client = null;
     _decoder.reset();
     isClientConnected.value = false;
+    activeSessionToken.value = '';
     connectedDevice.value = '';
     remoteAudioStreaming.value = false;
     remoteAudioConfig.value = const AudioConfig();
