@@ -145,6 +145,8 @@ target_link_libraries(aircast_video PRIVATE
         advapi32
         shell32
         winmm
+        ole32
+        windowscodecs
 )
 add_dependencies(${BINARY_NAME} aircast_video)
 install(TARGETS aircast_video RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}"

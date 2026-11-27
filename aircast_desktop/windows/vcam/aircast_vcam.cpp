@@ -1,4 +1,5 @@
 #define NOMINMAX
+#include <string>
 #include <windows.h>
 #include <dshow.h>
 #include <ks.h>

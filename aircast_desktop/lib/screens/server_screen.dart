@@ -1,4 +1,6 @@
 import 'package:aircast_desktop/controller/server_controller.dart';
+import 'package:aircast_desktop/controller/video_server_controller.dart';
+import 'package:aircast_desktop/screens/camera_monitor_screen.dart';
 import 'package:aircast_desktop/screens/mic_monitor_screen.dart';
 import 'package:aircast_desktop/screens/vcam_test_screen.dart';
 import 'package:flutter/material.dart';
@@ -11,6 +13,9 @@ class ServerScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = Get.put(ServerController());
+    if (!Get.isRegistered<VideoServerController>()) {
+      Get.put(VideoServerController(), permanent: true);
+    }
 
     return Scaffold(
       backgroundColor: const Color(0xFF0E0E10),
@@ -27,10 +32,16 @@ class ServerScreen extends StatelessWidget {
             ),
           ),
           FilledButton.tonalIcon(
+            onPressed: () => Get.to(() => const CameraMonitorScreen()),
+            icon: const Icon(Icons.videocam),
+            label: const Text('Camera Monitor'),
+          ),
+          FilledButton.tonalIcon(
             onPressed: () => Get.to(() => const VcamTestScreen()),
             icon: const Icon(Icons.videocam),
             label: const Text('Virtual Cam (3A)'),
           ),
+
           IconButton(
             tooltip: 'Refresh Network IPs',
             icon: const Icon(Icons.refresh),
